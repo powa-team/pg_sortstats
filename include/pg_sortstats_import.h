@@ -1,6 +1,12 @@
 #ifndef PG_SORTSTATS_IMPORT_h
 #define PG_SORTSTATS_IMPORT_h
 
+#include "nodes/execnodes.h"
+#include "utils/logtape.h"
+#if PG_VERSION_NUM < 90500
+#include "lib/stringinfo.h"
+#endif
+
 #if PG_VERSION_NUM >= 90400 && PG_VERSION_NUM < 90500
 #include "include/pg_sortstats_import_pg9_4.h"
 #elif PG_VERSION_NUM >= 90500 && PG_VERSION_NUM < 90600
@@ -17,9 +23,11 @@
 #error "PostgreSQL version not supported"
 #endif
 
-#if PG_VERSION_NUM < 90600
+bool pgsrt_PreScanNode(PlanState *planstate, Bitmapset **rels_used);
+void pgsrt_show_sortorder_options(StringInfo buf, Node *sortexpr,
+					   Oid sortOperator, Oid collation, bool nullsFirst);
 
-#include "nodes/execnodes.h"
+#if PG_VERSION_NUM < 90600
 
 bool planstate_tree_walker(PlanState *planstate,
 					  bool (*walker) (),
