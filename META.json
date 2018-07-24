@@ -1,0 +1,20 @@
+{
+   "name": "pg_sortstats",
+   "abstract": "An extension collecting statistics about sorts",
+   "version": "__VERSION__",
+   "maintainer": "Julien Rouhaud <rjuju123@gmail.com>",
+   "license": "postgresql",
+   "release_status": "stable",
+   "provides": {
+        "pg_sortstats": {
+            "abstract": "An extension collecting statistics about sorts",
+            "file": "pg_sortstats.sql",
+            "docfile": "README.md",
+            "version": "__VERSION__"
+        }
+    },
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "http://pgxn.org/meta/spec.txt"
+   }
+}
