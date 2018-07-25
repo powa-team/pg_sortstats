@@ -31,7 +31,7 @@
 PG_MODULE_MAGIC;
 
 /*--- Macros and structs ---*/
-#define PGSRT_COLUMNS		12			/* number of columns in pg_sortstats  SRF */
+#define PGSRT_COLUMNS		14			/* number of columns in pg_sortstats  SRF */
 #define PGSRT_KEYS_SIZE		80
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every pgsrt_entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
@@ -70,6 +70,8 @@ typedef struct pgsrtCounters
 	int64			external_sorts;			/* number of external sorts */
 	int64			external_merges;		/* number of external merges */
 	int64			nbtapes;
+	int64			space_disk;
+	int64			space_memory;
 	char			keys[PGSRT_KEYS_SIZE];	/* deparsed sort key */
 } pgsrtCounters;
 
@@ -551,6 +553,8 @@ pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters)
 	e->counters.external_sorts += counters->external_sorts;
 	e->counters.external_merges += counters->external_merges;
 	e->counters.nbtapes += counters->nbtapes;
+	e->counters.space_disk += counters->space_disk;
+	e->counters.space_memory += counters->space_memory;
 
 	SpinLockRelease(&e->mutex);
 
@@ -702,6 +706,17 @@ static bool pgsrt_planstate_walker(PlanState *ps, pgsrtWalkerContext *context)
 				counters.external_merges = 0;
 
 			counters.nbtapes = nbtapes;
+
+			if (stats.spaceType == SORT_SPACE_TYPE_DISK)
+				counters.space_disk = spaceUsed;
+			else
+				counters.space_disk = 0;
+
+			if (stats.spaceType == SORT_SPACE_TYPE_MEMORY)
+				counters.space_memory = spaceUsed;
+			else
+				counters.space_memory = 0;
+
 			memset(counters.keys, 0, PGSRT_KEYS_SIZE);
 			memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
 
@@ -902,6 +917,8 @@ pg_sortstats(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(tmp.external_sorts);
 		values[i++] = Int64GetDatumFast(tmp.external_merges);
 		values[i++] = Int64GetDatumFast(tmp.nbtapes);
+		values[i++] = Int64GetDatumFast(tmp.space_disk);
+		values[i++] = Int64GetDatumFast(tmp.space_memory);
 
 		Assert(i == PGSRT_COLUMNS);
 
