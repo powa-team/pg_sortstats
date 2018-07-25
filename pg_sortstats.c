@@ -194,7 +194,7 @@ _PG_init(void)
 							"Sets the maximum number of statements tracked by pg_sortstats.",
 							NULL,
 							&pgsrt_max,
-							1000,
+							10000,
 							100,
 							INT_MAX,
 							PGC_POSTMASTER,
