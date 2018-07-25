@@ -19,6 +19,9 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#if PG_VERSION_NUM < 110000
+#include "storage/spin.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #if PG_VERSION_NUM >= 90500
@@ -135,8 +138,9 @@ static void pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters);
 static uint32 pgsrt_hash_fn(const void *key, Size keysize);
 static int	pgsrt_match_fn(const void *key1, const void *key2, Size keysize);
 
+static void pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context);
 static bool pgsrt_planstate_walker(PlanState *ps, pgsrtWalkerContext *context);
-static char * pgsrt_get_sort_group_keys(PlanState *planstate,
+static char * pgsrt_get_sort_group_keys(SortState *srtstate,
 					 int nkeys, AttrNumber *keycols,
 					 Oid *sortOperators, Oid *collations, bool *nullsFirst,
 					 pgsrtWalkerContext *context);
@@ -589,163 +593,207 @@ pgsrt_match_fn(const void *key1, const void *key2, Size keysize)
 		return 1;
 }
 
+static void
+pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
+{
+	Plan *plan = srtstate->ss.ps.plan;
+	Tuplesortstate *state = (Tuplesortstate *) srtstate->tuplesortstate;
+#if PG_VERSION_NUM >= 110000
+	TuplesortInstrumentation stats;
+#endif
+	Sort *sort = (Sort *) plan;
+	pgsrtCounters counters;
+	char *deparsed;
+	int nbtapes = 0;
+#if PG_VERSION_NUM < 110000
+	const char *sortMethod;
+	const char *spaceType;
+#endif
+	long		spaceUsed;
+	bool found;
+	int mem_per_row;
+	int64 lines, lines_to_sort, w_m;
+	int tuple_palloc;
+	int i;
+
+	Assert(state);
+
+	/*
+	 * Estimate the per-line space used.  We use the average row width, and add
+	 * the fixed 16B palloc overhead
+	 */
+	tuple_palloc = sort->plan.plan_width + 16;
+
+	/*
+	 * Each tuple is palloced, and a palloc chunk always uses a 2^N size
+	 */
+	i = 1;
+	while (tuple_palloc > i)
+		i *=2;
+	tuple_palloc = i;
+
+	lines = 0;
+	/* get effective number of lines fed to the sort if available */
+	if (srtstate->ss.ps.instrument)
+		lines = srtstate->ss.ps.instrument->ntuples;
+
+	/* fallback to estimated # of lines if no value */
+	if (lines == 0)
+		lines = sort->plan.plan_rows;
+
+	/*
+	 * If the sort is bounded, set the number of lines to sort
+	 * accordingly, otherwise use the Sort input lines count.
+	 */
+	if (srtstate->bounded)
+		lines_to_sort = srtstate->bound;
+	else
+		lines_to_sort = lines;
+
+	/*
+	 * compute the per-row space needed. The involved struct aren't
+	 * exported, so just use raw number instead. FTR, the formula:
+	 * sizeof(SortTuple) + sizeof(MinimalTuple) + sizeof(AllocChunkData) + tuple_palloc
+	 * */
+	mem_per_row = 24 + 8 + 16 + tuple_palloc;
+	w_m = lines_to_sort * mem_per_row;
+
+	/*
+	 * If a bounded sort was asked, we'll try to sort only the bound limit
+	 * number of line, but a Top-N heapsort needs to be able to store twice the
+	 * amount of rows, so twice the memory is needed.
+	 */
+	if (srtstate->bounded)
+		w_m *= 2;
+
+	/* convert in kB, and add 1 kB as a quick round up */
+	w_m /= 1024;
+	w_m += 1;
+
+	/* deparse the sort keys */
+	deparsed = pgsrt_get_sort_group_keys(srtstate, sort->numCols,
+			sort->sortColIdx, sort->sortOperators, sort->collations,
+			sort->nullsFirst, context);
+
+#if PG_VERSION_NUM >= 110000
+	tuplesort_get_stats(state, &stats);
+	//sortMethod = tuplesort_method_name(stats.sortMethod);
+	//spaceType = tuplesort_space_type_name(stats.spaceType);
+	spaceUsed = stats.spaceUsed;
+#else
+	tuplesort_get_stats(state, &sortMethod, &spaceType, &spaceUsed);
+#endif
+
+	counters.lines = lines;
+	counters.lines_to_sort = lines_to_sort;
+	counters.work_mems = w_m;
+	found = false;
+#if PG_VERSION_NUM >= 110000
+	if (stats.sortMethod == SORT_TYPE_TOP_N_HEAPSORT)
+#else
+	if (strcmp(sortMethod, "top-N heapsort") == 0)
+#endif
+	{
+		counters.topn_sorts = 1;
+		found = true;
+	}
+	else
+		counters.topn_sorts = 0;
+
+#if PG_VERSION_NUM >= 110000
+	if (stats.sortMethod == SORT_TYPE_QUICKSORT)
+#else
+	if (!found && strcmp(sortMethod, "quicksort") == 0)
+#endif
+	{
+		counters.quicksorts = 1;
+		found = true;
+	}
+	else
+		counters.quicksorts = 0;
+
+#if PG_VERSION_NUM >= 110000
+	if (stats.sortMethod == SORT_TYPE_EXTERNAL_SORT)
+#else
+	if (!found && strcmp(sortMethod, "external sort") == 0)
+#endif
+	{
+		counters.external_sorts = 1;
+		found = true;
+	}
+	else
+		counters.external_sorts = 0;
+
+#if PG_VERSION_NUM >= 110000
+	if (stats.sortMethod == SORT_TYPE_EXTERNAL_MERGE)
+#else
+	if (!found && strcmp(sortMethod, "external merge") == 0)
+#endif
+	{
+		counters.external_merges = 1;
+		nbtapes = ((struct pgsrt_Tuplesortstate *) state)->currentRun + 1;
+		found = true;
+	}
+	else
+		counters.external_merges = 0;
+
+	Assert(found);
+
+	counters.nbtapes = nbtapes;
+
+#if PG_VERSION_NUM >= 110000
+	if (stats.spaceType == SORT_SPACE_TYPE_DISK)
+#else
+	if (strcmp(spaceType, "Disk") == 0)
+#endif
+	{
+		counters.space_disk = spaceUsed;
+		counters.space_memory = 0;
+	}
+	else
+	{
+		counters.space_disk = 0;
+		counters.space_memory = spaceUsed;
+	}
+
+	memset(counters.keys, 0, PGSRT_KEYS_SIZE);
+	memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
+
+	pgsrt_entry_store(context->queryDesc->plannedstmt->queryId, &counters);
+
+	//elog(WARNING, "sort info:\n"
+	//		"keys: %s\n"
+	//		"type: %s\n"
+	//		"space type: %s\n"
+	//		"space: %ld kB\n"
+	//		"lines to sort: %ld\n"
+	//		"w_m estimated: %ld kB\n"
+	//		"nbTapes: %d\n"
+#if PG_VERSION_NUM >= 110000
+	//		"parallel: %s (%d)\n"
+#endif
+	//		"bounded? %s - %s , bound %ld - %ld",
+	//		deparsed,
+	//		sortMethod,
+	//		spaceType,
+	//		spaceUsed,
+	//		lines_to_sort,
+	//		w_m,
+	//		nbtapes,
+#if PG_VERSION_NUM >= 110000
+	//		(srtstate->shared_info ? "yes" : "no"),(srtstate->shared_info ? srtstate->shared_info->num_workers : -1),
+#endif
+	//		(srtstate->bounded ? "yes":"no"),(srtstate->bounded_Done ? "yes":"no"), srtstate->bound, srtstate->bound_Done);
+}
+
 static bool pgsrt_planstate_walker(PlanState *ps, pgsrtWalkerContext *context)
 {
 	if (IsA(ps, SortState))
 	{
-		pgsrtCounters counters;
-		Plan *plan = ps->plan;
 		SortState *srtstate = (SortState *) ps;
-		Tuplesortstate *state = (Tuplesortstate *) srtstate->tuplesortstate;
-#if PG_VERSION_NUM >= 110000
-		TuplesortInstrumentation stats;
-#endif
-		Sort *sort = (Sort *) plan;
-		char *deparsed;
-		int nbtapes = 0;
-		const char *sortMethod;
-		const char *spaceType;
-		long		spaceUsed;
-		int mem_per_row;
-		int64 lines;
-		int64 lines_to_sort;
-		int tuple_palloc;
-		int i = 1;
-		int64 w_m;
 
-		if (state)
-		{
-			tuple_palloc = sort->plan.plan_width + 16;
-
-			/*
-			 * the tuple is palloced, and a palloc chunk always uses a 2^N
-			 * size
-			 */
-			while (tuple_palloc > i)
-				i *=2;
-			tuple_palloc = i;
-
-			lines = 0;
-			/* get effective number of lines */
-			if (ps->instrument)
-				lines = ps->instrument->ntuples;
-
-			/* fallback to estimated # of lines if no value */
-			if (lines == 0)
-				lines = sort->plan.plan_rows;
-
-			/*
-			 * If the sort is bounded, set the number of lines to sort
-			 * accordingly.
-			 */
-			if (srtstate->bounded)
-				lines_to_sort = srtstate->bound;
-			else
-				lines_to_sort = lines;
-
-			/*
-			 * compute the per-row space needed. The involved struct aren't
-			 * exported, so just use raw number instead. FTR, the formula:
-			 * sizeof(SortTuple) + sizeof(MinimalTuple) + sizeof(AllocChunkData) + palloced;
-			 * */
-			mem_per_row = 24 + 8 + 16 + tuple_palloc;
-			w_m = lines_to_sort * mem_per_row;
-
-			/*
-			 * If a bounded sort was asked, we'll try to sort the bound limit
-			 * number of line, but a Top-N heapsort requires twice the amount
-			 * of memory.
-			 */
-			if (srtstate->bounded)
-				w_m *= 2;
-
-			/* convert in kB, and add 1 kB as a quick round up */
-			w_m /= 1024;
-			w_m += 1;
-
-			/* deparse the sort keys */
-			deparsed = pgsrt_get_sort_group_keys(ps, sort->numCols,
-					sort->sortColIdx, sort->sortOperators, sort->collations,
-					sort->nullsFirst, context);
-
-#if PG_VERSION_NUM >= 110000
-			tuplesort_get_stats(state, &stats);
-			sortMethod = tuplesort_method_name(stats.sortMethod);
-			spaceType = tuplesort_space_type_name(stats.spaceType);
-			spaceUsed = stats.spaceUsed;
-#else
-			tuplesort_get_stats(state, &sortMethod, &spaceType, &spaceUsed);
-#endif
-
-			if (strcmp(sortMethod, "external merge") == 0)
-			{
-				nbtapes = ((struct pgsrt_Tuplesortstate *) state)->currentRun + 1;
-			}
-
-			counters.lines = lines;
-			counters.lines_to_sort = lines_to_sort;
-			counters.work_mems = w_m;
-			if (stats.sortMethod == SORT_TYPE_TOP_N_HEAPSORT)
-				counters.topn_sorts = 1;
-			else
-				counters.topn_sorts = 0;
-
-			if (stats.sortMethod == SORT_TYPE_QUICKSORT)
-				counters.quicksorts = 1;
-			else
-				counters.quicksorts = 0;
-
-			if (stats.sortMethod == SORT_TYPE_EXTERNAL_SORT)
-				counters.external_sorts = 1;
-			else
-				counters.external_sorts = 0;
-
-			if (stats.sortMethod == SORT_TYPE_EXTERNAL_MERGE)
-				counters.external_merges = 1;
-			else
-				counters.external_merges = 0;
-
-			counters.nbtapes = nbtapes;
-
-			if (stats.spaceType == SORT_SPACE_TYPE_DISK)
-				counters.space_disk = spaceUsed;
-			else
-				counters.space_disk = 0;
-
-			if (stats.spaceType == SORT_SPACE_TYPE_MEMORY)
-				counters.space_memory = spaceUsed;
-			else
-				counters.space_memory = 0;
-
-			memset(counters.keys, 0, PGSRT_KEYS_SIZE);
-			memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
-
-			pgsrt_entry_store(context->queryDesc->plannedstmt->queryId, &counters);
-
-			//elog(WARNING, "sort info:\n"
-			//		"keys: %s\n"
-			//		"type: %s\n"
-			//		"space type: %s\n"
-			//		"space: %ld kB\n"
-			//		"lines to sort: %ld\n"
-			//		"w_m estimated: %ld kB\n"
-			//		"nbTapes: %d\n"
-#if PG_VERSI//ON_NUM >= 110000
-			//		"parallel: %s (%d)\n"
-#endif
-			//		"bounded? %s - %s , bound %ld - %ld",
-			//		deparsed,
-			//		sortMethod,
-			//		spaceType,
-			//		spaceUsed,
-			//		lines_to_sort,
-			//		w_m,
-			//		nbtapes,
-#if PG_VERSI//ON_NUM >= 110000
-			//		(srtstate->shared_info ? "yes" : "no"),(srtstate->shared_info ? srtstate->shared_info->num_workers : -1),
-#endif
-			//		(srtstate->bounded ? "yes":"no"),(srtstate->bounded_Done ? "yes":"no"), srtstate->bound, srtstate->bound_Done);
-		}
+		if (srtstate->tuplesortstate)
+			pgsrt_process_sortstate(srtstate, context);
 	}
 
 	context->ancestors = lcons(ps, context->ancestors);
@@ -772,12 +820,12 @@ pgsrt_setup_walker_context(pgsrtWalkerContext *context)
 
 /* Adapted from show_sort_group_keys */
 static char *
-pgsrt_get_sort_group_keys(PlanState *planstate,
+pgsrt_get_sort_group_keys(SortState *srtstate,
 					 int nkeys, AttrNumber *keycols,
 					 Oid *sortOperators, Oid *collations, bool *nullsFirst,
 					 pgsrtWalkerContext *context)
 {
-	Plan	   *plan = planstate->plan;
+	Plan	   *plan = srtstate->ss.ps.plan;
 	List	   *dp_context = NIL;
 	StringInfoData sortkeybuf;
 	bool		useprefix;
@@ -792,7 +840,7 @@ pgsrt_get_sort_group_keys(PlanState *planstate,
 
 	/* Set up deparsing context */
 	dp_context = set_deparse_context_planstate(context->deparse_cxt,
-											(Node *) planstate,
+											(Node *) srtstate,
 											context->ancestors);
 	useprefix = (list_length(context->rtable) > 1);
 
