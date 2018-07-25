@@ -14,8 +14,14 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "access/hash.h"
+#if PG_VERSION_NUM >= 90600
+#include "access/parallel.h"
+#endif
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#if PG_VERSION_NUM >= 90600
+#include "postmaster/autovacuum.h"
+#endif
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -50,8 +56,12 @@ typedef uint32 pgsrt_queryid;
 
 typedef struct pgsrtSharedState
 {
-	LWLockId	lock;					/* protects hashtable search/modification */
-	double		cur_median_usage;		/* current median usage in hashtable */
+	LWLockId		lock;				/* protects hashtable search/modification */
+	double			cur_median_usage;	/* current median usage in hashtable */
+#if PG_VERSION_NUM >= 90600
+	LWLockId		queryids_lock;		/* protects following array */
+	pgsrt_queryid	queryids[FLEXIBLE_ARRAY_MEMBER]; /* queryid of non-worker processes */
+#endif
 } pgsrtSharedState;
 
 typedef struct pgsrtHashKey
@@ -130,6 +140,11 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static Size pgsrt_memsize(void);
+#if PG_VERSION_NUM >= 90600
+static Size pgsrt_queryids_size(void);
+static pgsrt_queryid pgsrt_get_queryid(void);
+static void pgsrt_set_queryid(pgsrt_queryid);
+#endif
 
 static pgsrtEntry *pgsrt_entry_alloc(pgsrtHashKey *key, char *keys);
 static void pgsrt_entry_dealloc(void);
@@ -190,9 +205,9 @@ _PG_init(void)
 
 	RequestAddinShmemSpace(pgsrt_memsize());
 #if PG_VERSION_NUM >= 90600
-	RequestNamedLWLockTranche("pg_sortstats", 1);
+	RequestNamedLWLockTranche("pg_sortstats", 2);
 #else
-	RequestAddinLWLocks(1);
+	RequestAddinLWLocks(2);
 #endif
 
 	/* install hooks */
@@ -225,16 +240,24 @@ pgsrt_shmem_startup(void)
 
 	/* global access lock */
 	pgsrt = ShmemInitStruct("pg_sortstats",
-					sizeof(pgsrtSharedState),
+					(sizeof(pgsrtSharedState)
+#if PG_VERSION_NUM >= 90600
+					+ pgsrt_queryids_size()
+#endif
+					),
 					&found);
 
 	if (!found)
 	{
 		/* First time through ... */
 #if PG_VERSION_NUM >= 90600
-		pgsrt->lock = &(GetNamedLWLockTranche("pg_sortstats"))->lock;
+		LWLockPadded *locks = GetNamedLWLockTranche("pg_sortstats");
+		pgsrt->lock = &(locks[0]).lock;
+		pgsrt->queryids_lock = &(locks[1]).lock;
+		memset(pgsrt->queryids, 0, pgsrt_queryids_size());
 #else
 		pgsrt->lock = LWLockAssign();
+		pgsrt->queryids_lock = LWLockAssign();
 #endif
 	}
 
@@ -281,14 +304,13 @@ _PG_fini(void)
 }
 
 /*
- * Nothing to do?
+ * Save this query's queryId if it's not a parallel worker
  */
 static void
 pgsrt_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	if (pgsrt_enabled)
-	{
-	}
+	if (pgsrt_enabled && !IsParallelWorker())
+		pgsrt_set_queryid(queryDesc->plannedstmt->queryId);
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -376,6 +398,10 @@ pgsrt_ExecutorEnd(QueryDesc *queryDesc)
 		context.ancestors = NIL;
 
 		pgsrt_planstate_walker(queryDesc->planstate, &context);
+
+		/* Remove the saved queryid for safety */
+		if (!IsParallelWorker())
+			pgsrt_set_queryid(0);
 	}
 
 	if (prev_ExecutorEnd)
@@ -394,6 +420,52 @@ pgsrt_memsize(void)
 
 	return size;
 }
+
+#if PG_VERSION_NUM >= 90600
+/* Parallel workers won't have their queryid setup.  We store the leader
+ * process' queryid in shared memory so that workers can find which queryid
+ * they're actually executing.
+ */
+static Size
+pgsrt_queryids_size(void)
+{
+	/* We need frrom for all possible backends, plus the autovacuum launcher
+	 * and workers, plus the background workers, and an extra one since
+	 * BackendId numerotation starts at 1.
+	 */
+#define PGSRT_NB_BACKEND_SLOT (MaxConnections \
+			 + autovacuum_max_workers + 1 \
+			 + max_worker_processes + 1)
+
+	return MAXALIGN(sizeof(pgsrt_queryid) * PGSRT_NB_BACKEND_SLOT);
+}
+
+static pgsrt_queryid
+pgsrt_get_queryid(void)
+{
+	pgsrt_queryid queryId;
+
+	Assert(IsParallelWorker());
+	Assert(MyBackendId <= PGSRT_NB_BACKEND_SLOT);
+
+	LWLockAcquire(pgsrt->queryids_lock, LW_SHARED);
+	queryId = pgsrt->queryids[ParallelMasterBackendId];
+	LWLockRelease(pgsrt->queryids_lock);
+
+	return queryId;
+}
+
+static void
+pgsrt_set_queryid(pgsrt_queryid queryId)
+{
+	Assert(!IsParallelWorker());
+	Assert(MyBackendId <= PGSRT_NB_BACKEND_SLOT);
+
+	LWLockAcquire(pgsrt->queryids_lock, LW_EXCLUSIVE);
+	pgsrt->queryids[MyBackendId] = queryId;
+	LWLockRelease(pgsrt->queryids_lock);
+}
+#endif
 
 /*
  * Allocate a new hashtable entry.
@@ -605,6 +677,7 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	TuplesortInstrumentation stats;
 #endif
 	Sort *sort = (Sort *) plan;
+	pgsrt_queryid queryId;
 	pgsrtCounters counters;
 	char *deparsed;
 	int nbtapes = 0;
@@ -762,7 +835,12 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	memset(counters.keys, 0, PGSRT_KEYS_SIZE);
 	memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
 
-	pgsrt_entry_store(context->queryDesc->plannedstmt->queryId, &counters);
+	if (IsParallelWorker())
+		queryId = pgsrt_get_queryid();
+	else
+		queryId = context->queryDesc->plannedstmt->queryId;
+
+	pgsrt_entry_store(queryId, &counters);
 
 	//elog(WARNING, "sort info:\n"
 	//		"keys: %s\n"
