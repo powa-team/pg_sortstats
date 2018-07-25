@@ -367,13 +367,16 @@ pgsrt_ExecutorFinish(QueryDesc *queryDesc)
 static void
 pgsrt_ExecutorEnd(QueryDesc *queryDesc)
 {
-	pgsrtWalkerContext context;
-
-	context.queryDesc = queryDesc;
-	context.ancestors = NIL;
-
 	/* retrieve sorts informations, main work starts from here */
-	pgsrt_planstate_walker(queryDesc->planstate, &context);
+	if (pgsrt_enabled)
+	{
+		pgsrtWalkerContext context;
+
+		context.queryDesc = queryDesc;
+		context.ancestors = NIL;
+
+		pgsrt_planstate_walker(queryDesc->planstate, &context);
+	}
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
@@ -786,6 +789,9 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	//		(srtstate->bounded ? "yes":"no"),(srtstate->bounded_Done ? "yes":"no"), srtstate->bound, srtstate->bound_Done);
 }
 
+/*
+ * walker functions that recurse the planstate tree looking for sort nodes.
+ */
 static bool pgsrt_planstate_walker(PlanState *ps, pgsrtWalkerContext *context)
 {
 	if (IsA(ps, SortState))
