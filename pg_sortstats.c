@@ -40,7 +40,7 @@
 PG_MODULE_MAGIC;
 
 /*--- Macros and structs ---*/
-#define PGSRT_COLUMNS		14			/* number of columns in pg_sortstats  SRF */
+#define PGSRT_COLUMNS		16			/* number of columns in pg_sortstats  SRF */
 #define PGSRT_KEYS_SIZE		80
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every pgsrt_entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
@@ -82,9 +82,11 @@ typedef struct pgsrtCounters
 	int64			quicksorts;				/* number of quicksorts */
 	int64			external_sorts;			/* number of external sorts */
 	int64			external_merges;		/* number of external merges */
-	int64			nbtapes;
-	int64			space_disk;
-	int64			space_memory;
+	int64			nbtapes;				/* total number of tapes used */
+	int64			space_disk;				/* total disk space consumed */
+	int64			space_memory;			/* total memory space consumed */
+	int64			non_parallels;			/* number of non parallel sorts */
+	int64			nb_workers;				/* total number of parallel workers */
 	char			keys[PGSRT_KEYS_SIZE];	/* deparsed sort key */
 } pgsrtCounters;
 
@@ -634,6 +636,8 @@ pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters)
 	e->counters.nbtapes += counters->nbtapes;
 	e->counters.space_disk += counters->space_disk;
 	e->counters.space_memory += counters->space_memory;
+	e->counters.non_parallels += counters->non_parallels;
+	e->counters.nb_workers += counters->nb_workers;
 
 	SpinLockRelease(&e->mutex);
 
@@ -831,6 +835,21 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 		counters.space_disk = 0;
 		counters.space_memory = spaceUsed;
 	}
+
+#if PG_VERSION_NUM >= 110000
+	if (srtstate->shared_info){
+		counters.non_parallels = 0;
+		counters.nb_workers = srtstate->shared_info->num_workers;
+	}
+	else
+	{
+		counters.non_parallels = 1;
+		counters.nb_workers = 0;
+	}
+#else
+	counters.non_parallels = 1;
+	counters.nb_workers = 0;
+#endif
 
 	memset(counters.keys, 0, PGSRT_KEYS_SIZE);
 	memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
@@ -1051,6 +1070,12 @@ pg_sortstats(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(tmp.nbtapes);
 		values[i++] = Int64GetDatumFast(tmp.space_disk);
 		values[i++] = Int64GetDatumFast(tmp.space_memory);
+		values[i++] = Int64GetDatumFast(tmp.non_parallels);
+#if PG_VERSION_NUM >= 110000
+		values[i++] = Int64GetDatumFast(tmp.nb_workers);
+#else
+		nulls[i++] = true;
+#endif
 
 		Assert(i == PGSRT_COLUMNS);
 

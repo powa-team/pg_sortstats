@@ -22,7 +22,9 @@ CREATE FUNCTION pg_sortstats(
     OUT external_merges bigint,
     OUT nbtapes bigint,
     OUT space_disk bigint,
-    OUT space_memory bigint
+    OUT space_memory bigint,
+    OUT non_parallels bigint,
+    OUT nb_workers bigint
 )
     RETURNS SETOF record
 LANGUAGE c COST 1000
