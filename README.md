@@ -23,5 +23,5 @@ The `pg_sortstats()` set-returning functions provides the following fields:
 | space_disk      | total disk space used to perform the sort                                        |
 | space_memory    | total memory space used to perform the sort                                      |
 | non_parallels   | total number of sorts not done in parallel                                       |
-| nb_workers      | total number of workers used to perform the sort                                 |
+| nb_workers      | total number of processes used to perform the sort                                 |
 

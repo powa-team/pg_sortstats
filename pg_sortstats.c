@@ -86,7 +86,7 @@ typedef struct pgsrtCounters
 	int64			space_disk;				/* total disk space consumed */
 	int64			space_memory;			/* total memory space consumed */
 	int64			non_parallels;			/* number of non parallel sorts */
-	int64			nb_workers;				/* total number of parallel workers */
+	int64			nb_workers;				/* total number of parallel workers (including gather node) */
 	char			keys[PGSRT_KEYS_SIZE];	/* deparsed sort key */
 } pgsrtCounters;
 
@@ -839,7 +839,12 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 #if PG_VERSION_NUM >= 110000
 	if (srtstate->shared_info){
 		counters.non_parallels = 0;
-		counters.nb_workers = srtstate->shared_info->num_workers;
+		/*
+		 * we compute the total number of processes participating to the sort,
+		 * so we have to increment the number of workers to take the gather
+		 * node into account
+		 */
+		counters.nb_workers = srtstate->shared_info->num_workers + 1;
 	}
 	else
 	{
