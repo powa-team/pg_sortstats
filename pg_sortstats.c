@@ -4,7 +4,7 @@
  *		Track statistics about sorts performs, and also estimate how much
  *		work_mem would have been needed to sort data in memory.
  *
- * Copyright (c) 2018, Julien Rouhaud
+ * Copyright (c) 2018, The PoWA-team
  *
  *-------------------------------------------------------------------------
  */
