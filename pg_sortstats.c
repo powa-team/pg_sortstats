@@ -205,6 +205,8 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	EmitWarningsOnPlaceholders("pg_sortstats");
+
 	RequestAddinShmemSpace(pgsrt_memsize());
 #if PG_VERSION_NUM >= 90600
 	RequestNamedLWLockTranche("pg_sortstats", 2);
