@@ -12,6 +12,7 @@ CREATE FUNCTION pg_sortstats(
     OUT queryid bigint,
     OUT userid oid,
     OUT dbid oid,
+    OUT nb_keys integer,
     OUT sort_key text,
     OUT lines bigint,
     OUT lines_to_sort bigint,

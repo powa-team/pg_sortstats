@@ -40,7 +40,7 @@
 PG_MODULE_MAGIC;
 
 /*--- Macros and structs ---*/
-#define PGSRT_COLUMNS		16			/* number of columns in pg_sortstats  SRF */
+#define PGSRT_COLUMNS		17			/* number of columns in pg_sortstats  SRF */
 #define PGSRT_KEYS_SIZE		80
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every pgsrt_entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
@@ -69,6 +69,7 @@ typedef struct pgsrtHashKey
 	Oid				userid;			/* user OID */
 	Oid				dbid;			/* database OID */
 	pgsrt_queryid	queryid;		/* query identifier */
+	int				nbkeys;			/* number of columns to sort */
 	uint32			sortid;			/* sort identifier withing a query */
 } pgsrtHashKey;
 
@@ -151,7 +152,7 @@ static void pgsrt_set_queryid(pgsrt_queryid);
 static pgsrtEntry *pgsrt_entry_alloc(pgsrtHashKey *key, char *keys);
 static void pgsrt_entry_dealloc(void);
 static void pgsrt_entry_reset(void);
-static void pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters);
+static void pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters);
 static uint32 pgsrt_hash_fn(const void *key, Size keysize);
 static int	pgsrt_match_fn(const void *key1, const void *key2, Size keysize);
 
@@ -587,7 +588,7 @@ pgsrt_entry_reset(void)
 }
 
 static void
-pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters)
+pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters)
 {
 	volatile pgsrtEntry *e;
 
@@ -602,6 +603,7 @@ pgsrt_entry_store(pgsrt_queryid queryId, pgsrtCounters *counters)
 	key.userid = GetUserId();
 	key.dbid = MyDatabaseId;
 	key.queryid = queryId;
+	key.nbkeys = nbkeys;
 	key.sortid = (uint32) hash_any((unsigned char *) counters->keys,
 			strlen(counters->keys));
 
@@ -655,6 +657,7 @@ pgsrt_hash_fn(const void *key, Size keysize)
 	return hash_uint32((uint32) k->userid) ^
 		hash_uint32((uint32) k->dbid) ^
 		hash_uint32((uint32) k->queryid) ^
+		hash_uint32((uint32) k->nbkeys) ^
 		k->sortid;
 }
 
@@ -668,6 +671,7 @@ pgsrt_match_fn(const void *key1, const void *key2, Size keysize)
 	if (k1->userid == k2->userid &&
 		k1->dbid == k2->dbid &&
 		k1->queryid == k2->queryid &&
+		k1->nbkeys == k2->nbkeys &&
 		k1->sortid == k2->sortid)
 		return 0;
 	else
@@ -866,7 +870,7 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	else
 		queryId = context->queryDesc->plannedstmt->queryId;
 
-	pgsrt_entry_store(queryId, &counters);
+	pgsrt_entry_store(queryId, sort->numCols, &counters);
 
 	//elog(WARNING, "sort info:\n"
 	//		"keys: %s\n"
@@ -1063,9 +1067,10 @@ pg_sortstats(PG_FUNCTION_ARGS)
 			SpinLockRelease(&e->mutex);
 		}
 
-		values[i++] = Int64GetDatum(entry->key.queryid);
+		values[i++] = Int64GetDatumFast(entry->key.queryid);
 		values[i++] = ObjectIdGetDatum(entry->key.userid);
 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
+		values[i++] = Int32GetDatum(entry->key.nbkeys);
 		values[i++] = CStringGetTextDatum(tmp.keys);
 		values[i++] = Int64GetDatumFast(tmp.lines);
 		values[i++] = Int64GetDatumFast(tmp.lines_to_sort);
