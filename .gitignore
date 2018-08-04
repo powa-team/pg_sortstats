@@ -5,3 +5,4 @@
 *.bc
 *.gcno
 tags
+results/

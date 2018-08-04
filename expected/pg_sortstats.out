@@ -1,0 +1,67 @@
+CREATE EXTENSION pg_sortstats;
+CREATE TABLE sorts (id integer, val text);
+INSERT INTO sorts SELECT i, 'line ' || i FROM generate_series(1, 100000) i;
+VACUUM ANALYZE sorts;
+SET work_mem = '64kB';
+WITH src AS (
+    SELECT * FROM sorts ORDER BY val COLLATE "C", id DESC
+)
+SELECT * FROM src LIMIT 1;
+ id |  val   
+----+--------
+  1 | line 1
+(1 row)
+
+SELECT * FROM sorts ORDER BY id DESC LIMIT 1;
+   id   |     val     
+--------+-------------
+ 100000 | line 100000
+(1 row)
+
+SELECT nb_keys, sort_keys, lines, lines_to_sort,
+    work_mems < (11 * 1024) AS "exp_less_11MB",
+    topn_sorts, quicksorts, external_sorts, external_merges, nb_tapes,
+    space_disk > 1024 AS "disk_more_1MB",
+    space_memory > 1024 AS  "mem_more_1MB",
+    non_parallels, nb_workers
+FROM pg_sortstats(true) ORDER BY nb_keys;
+ nb_keys |              sort_keys               | lines  | lines_to_sort | exp_less_11MB | topn_sorts | quicksorts | external_sorts | external_merges | nb_tapes | disk_more_1MB | mem_more_1MB | non_parallels | nb_workers 
+---------+--------------------------------------+--------+---------------+---------------+------------+------------+----------------+-----------------+----------+---------------+--------------+---------------+------------
+       1 | id DESC                              | 100000 |             1 | t             |          1 |          0 |              0 |               0 |        0 | f             | f            |             1 |          0
+       2 | sorts.val COLLATE "C", sorts.id DESC | 100000 |        100000 | t             |          0 |          0 |              0 |               1 |      216 | t             | f            |             1 |          0
+(2 rows)
+
+SELECT * FROM pg_sortstats_reset();
+ pg_sortstats_reset 
+--------------------
+ 
+(1 row)
+
+SET work_mem = '11MB';
+WITH src AS (
+    SELECT * FROM sorts ORDER BY val COLLATE "C", id DESC
+)
+SELECT * FROM src LIMIT 1;
+ id |  val   
+----+--------
+  1 | line 1
+(1 row)
+
+SELECT nb_keys, sort_keys, lines, lines_to_sort,
+    work_mems < (11 * 1024) AS "exp_less_11MB",
+    topn_sorts, quicksorts, external_sorts, external_merges, nb_tapes,
+    space_disk > 1024 AS "disk_more_1MB",
+    space_memory > 1024 AS  "mem_more_1MB",
+    non_parallels, nb_workers
+FROM pg_sortstats(true) ORDER BY nb_keys;
+ nb_keys |              sort_keys               | lines  | lines_to_sort | exp_less_11MB | topn_sorts | quicksorts | external_sorts | external_merges | nb_tapes | disk_more_1MB | mem_more_1MB | non_parallels | nb_workers 
+---------+--------------------------------------+--------+---------------+---------------+------------+------------+----------------+-----------------+----------+---------------+--------------+---------------+------------
+       2 | sorts.val COLLATE "C", sorts.id DESC | 100000 |        100000 | t             |          0 |          1 |              0 |               0 |        0 | f             | t            |             1 |          0
+(1 row)
+
+SELECT * FROM pg_sortstats_reset();
+ pg_sortstats_reset 
+--------------------
+ 
+(1 row)
+
