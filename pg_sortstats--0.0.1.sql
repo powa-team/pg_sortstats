@@ -8,7 +8,7 @@
 
 SET client_encoding = 'UTF8';
 
-CREATE FUNCTION pg_sortstats(
+CREATE FUNCTION pg_sortstats(IN showtext boolean,
     OUT queryid bigint,
     OUT userid oid,
     OUT dbid oid,
@@ -27,9 +27,9 @@ CREATE FUNCTION pg_sortstats(
     OUT non_parallels bigint,
     OUT nb_workers bigint
 )
-    RETURNS SETOF record
-LANGUAGE c COST 1000
-AS '$libdir/pg_sortstats', 'pg_sortstats';
+RETURNS SETOF record
+AS '$libdir/pg_sortstats', 'pg_sortstats'
+LANGUAGE C STRICT VOLATILE COST 1000;
 
 CREATE FUNCTION pg_sortstats_reset()
     RETURNS void

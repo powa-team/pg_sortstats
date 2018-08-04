@@ -4,23 +4,48 @@
  *		Track statistics about sorts performs, and also estimate how much
  *		work_mem would have been needed to sort data in memory.
  *
+ * This module is heavily inspired on the great pg_stat_statements official
+ * contrib.  The same locking rules are used, which for reference are:
+ *
+ * Note about locking issues: to create or delete an entry in the shared
+ * hashtable, one must hold pgsrt->lock exclusively.  Modifying any field
+ * in an entry except the counters requires the same.  To look up an entry,
+ * one must hold the lock shared.  To read or update the counters within
+ * an entry, one must hold the lock shared or exclusive (so the entry doesn't
+ * disappear!) and also take the entry's mutex spinlock.
+ * The shared state variable pgsrt->extent (the next free spot in the external
+ * keys-text file) should be accessed only while holding either the
+ * pgsrt->mutex spinlock, or exclusive lock on pgsrt->lock.  We use the mutex
+ * to allow reserving file space while holding only shared lock on pgsrt->lock.
+ * Rewriting the entire external keys-text file, eg for garbage collection,
+ * requires holding pgsrt->lock exclusively; this allows individual entries
+ * in the file to be read or written while holding only shared lock.
+ *
  * Copyright (c) 2018, The PoWA-team
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "access/hash.h"
 #if PG_VERSION_NUM >= 90600
 #include "access/parallel.h"
 #endif
+#include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #if PG_VERSION_NUM >= 90600
 #include "postmaster/autovacuum.h"
+#endif
+#if PG_VERSION_NUM < 100000
+#include "storage/fd.h"
 #endif
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -30,6 +55,9 @@
 #endif
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#if PG_VERSION_NUM < 110000
+#include "utils/memutils.h"
+#endif
 #if PG_VERSION_NUM >= 90500
 #include "utils/ruleutils.h"
 #endif
@@ -40,11 +68,40 @@
 PG_MODULE_MAGIC;
 
 /*--- Macros and structs ---*/
+
+/* Location of permanent stats file (valid when database is shut down) */
+#define PGSRT_DUMP_FILE	PGSTAT_STAT_PERMANENT_DIRECTORY "/pg_sortstats.stat"
+
+/*
+ * Location of external keys text file.  We don't keep it in the core
+ * system's stats_temp_directory.  The core system can safely use that GUC
+ * setting, because the statistics collector temp file paths are set only once
+ * as part of changing the GUC, but pg_sortstats has no way of avoiding
+ * race conditions.  Besides, we only expect modest, infrequent I/O for keys
+ * strings, so placing the file on a faster filesystem is not compelling.
+ */
+#define PGSRT_TEXT_FILE	PG_STAT_TMP_DIR "/pgsrt_sortkey_texts.stat"
+
+/* Magic number identifying the stats file format */
+static const uint32 PGSRT_FILE_HEADER = 0x20180804;
+
+/* PostgreSQL major version number, changes in which invalidate all entries */
+static const uint32 PGSRT_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
+
 #define PGSRT_COLUMNS		17			/* number of columns in pg_sortstats  SRF */
-#define PGSRT_KEYS_SIZE		80
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every pgsrt_entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 #define USAGE_INIT	(1.0)
+#define ASSUMED_MEDIAN_INIT		(10.0)	/* initial assumed median usage */
+#define ASSUMED_LENGTH_INIT		128		/* initial assumed mean keys length */
+
+#define record_gc_ktexts() \
+	do { \
+		volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt; \
+		SpinLockAcquire(&s->mutex); \
+		s->gc_count++; \
+		SpinLockRelease(&s->mutex); \
+	} while(0)
 
 /* In PostgreSQL 11, queryid becomes a uint64 internally.
  */
@@ -58,6 +115,11 @@ typedef struct pgsrtSharedState
 {
 	LWLockId		lock;				/* protects hashtable search/modification */
 	double			cur_median_usage;	/* current median usage in hashtable */
+	Size			mean_keys_len;		/* current mean keys text length */
+	slock_t			mutex;				/* protects following fields only: */
+	Size			extent;				/* current extent of keys file */
+	int				n_writers;			/* number of active writers to keys file */
+	int				gc_count;			/* keys file garbage collection cycle count */
 #if PG_VERSION_NUM >= 90600
 	LWLockId		queryids_lock;		/* protects following array */
 	pgsrt_queryid	queryids[FLEXIBLE_ARRAY_MEMBER]; /* queryid of non-worker processes */
@@ -69,7 +131,6 @@ typedef struct pgsrtHashKey
 	Oid				userid;			/* user OID */
 	Oid				dbid;			/* database OID */
 	pgsrt_queryid	queryid;		/* query identifier */
-	int				nbkeys;			/* number of columns to sort */
 	uint32			sortid;			/* sort identifier withing a query */
 } pgsrtHashKey;
 
@@ -88,14 +149,17 @@ typedef struct pgsrtCounters
 	int64			space_memory;			/* total memory space consumed */
 	int64			non_parallels;			/* number of non parallel sorts */
 	int64			nb_workers;				/* total number of parallel workers (including gather node) */
-	char			keys[PGSRT_KEYS_SIZE];	/* deparsed sort key */
 } pgsrtCounters;
 
 typedef struct pgsrtEntry
 {
 	pgsrtHashKey	key;
-	pgsrtCounters	counters;	/* statistics for this sort */
-	slock_t			mutex;				/* protects the counters only */
+	pgsrtCounters	counters;		/* statistics for this sort */
+	int				nbkeys;			/* # of columns in the sort */
+	Size			keys_offset;	/* deparsed keys text offset in external file */
+	int				keys_len;		/* # of valid bytes in deparsed keys string, or -1 */
+	int				encoding;		/* deparsed keys text encoding */
+	slock_t			mutex;			/* protects the counters only */
 } pgsrtEntry;
 
 typedef struct pgsrtWalkerContext
@@ -149,12 +213,22 @@ static pgsrt_queryid pgsrt_get_queryid(void);
 static void pgsrt_set_queryid(pgsrt_queryid);
 #endif
 
-static pgsrtEntry *pgsrt_entry_alloc(pgsrtHashKey *key, char *keys);
+static pgsrtEntry *pgsrt_entry_alloc(pgsrtHashKey *key, Size keys_offset,
+		int keys_len, int encoding, int nbkeys);
 static void pgsrt_entry_dealloc(void);
 static void pgsrt_entry_reset(void);
-static void pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters);
+static void pgsrt_store(pgsrt_queryid queryId, int nbkeys, char *keys,
+		pgsrtCounters *counters);
 static uint32 pgsrt_hash_fn(const void *key, Size keysize);
 static int	pgsrt_match_fn(const void *key1, const void *key2, Size keysize);
+
+static bool ktext_store(const char *keys, int keys_len, Size *keys_offset,
+		int *gc_count);
+static char *ktext_load_file(Size *buffer_size);
+static char *ktext_fetch(Size keys_offset, int keys_len, char *buffer,
+		Size buffer_size);
+static bool need_gc_ktexts(void);
+static void gc_ktexts(void);
 
 static void pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context);
 static bool pgsrt_planstate_walker(PlanState *ps, pgsrtWalkerContext *context);
@@ -166,8 +240,10 @@ static void pgsrt_setup_walker_context(pgsrtWalkerContext *context);
 
 /*--- Local variables ---*/
 static int nesting_level = 0;
+
 static bool pgsrt_enabled;
-static int pgsrt_max;
+static int pgsrt_max;			/* max #of sorts to track */
+static bool pgsrt_save;			/* whether to save stats across shutdown */
 
 static HTAB *pgsrt_hash = NULL;
 static pgsrtSharedState *pgsrt = NULL;
@@ -206,8 +282,24 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomBoolVariable("pg_sortstats.save",
+							 "Save pg_sortstats statistics across server shutdowns.",
+							 NULL,
+							 &pgsrt_save,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	EmitWarningsOnPlaceholders("pg_sortstats");
 
+	/*
+	 * Request additional shared resources.  (These are no-ops if we're not in
+	 * the postmaster process.)  We'll allocate or attach to the shared
+	 * resources in pgsrt_shmem_startup().
+	 */
 	RequestAddinShmemSpace(pgsrt_memsize());
 #if PG_VERSION_NUM >= 90600
 	RequestNamedLWLockTranche("pg_sortstats", 2);
@@ -228,11 +320,32 @@ _PG_init(void)
 	shmem_startup_hook = pgsrt_shmem_startup;
 }
 
+void
+_PG_fini(void)
+{
+	/* Uninstall hooks. */
+	shmem_startup_hook = prev_shmem_startup_hook;
+	ExecutorStart_hook = prev_ExecutorStart;
+	ExecutorRun_hook = prev_ExecutorRun;
+	ExecutorFinish_hook = prev_ExecutorFinish;
+	ExecutorEnd_hook = prev_ExecutorEnd;
+}
+
 static void
 pgsrt_shmem_startup(void)
 {
 	bool		found;
 	HASHCTL		info;
+	FILE	   *file = NULL;
+	FILE	   *kfile = NULL;
+	uint32		header;
+	int32		num;
+	int32		pgver;
+	int32		i;
+	int			buffer_size;
+	char	   *buffer = NULL;
+	Size		tottextlen;
+	int			nvalidtexts;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -264,6 +377,12 @@ pgsrt_shmem_startup(void)
 		pgsrt->lock = LWLockAssign();
 		pgsrt->queryids_lock = LWLockAssign();
 #endif
+		pgsrt->cur_median_usage = ASSUMED_MEDIAN_INIT;
+		pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
+		SpinLockInit(&pgsrt->mutex);
+		pgsrt->extent = 0;
+		pgsrt->n_writers = 0;
+		pgsrt->gc_count = 0;
 	}
 
 	memset(&info, 0, sizeof(info));
@@ -288,24 +407,257 @@ pgsrt_shmem_startup(void)
 	 */
 	if (found)
 		return;
+
+	/*
+	 * Note: we don't bother with locks here, because there should be no other
+	 * processes running when this code is reached.
+	 */
+
+	/* Unlink keys text file possibly left over from crash */
+	unlink(PGSRT_TEXT_FILE);
+
+	/* Allocate new keys text temp file */
+	kfile = AllocateFile(PGSRT_TEXT_FILE, PG_BINARY_W);
+	if (kfile == NULL)
+		goto write_error;
+
+	/*
+	 * If we were told not to load old statistics, we're done.  (Note we do
+	 * not try to unlink any old dump file in this case.  This seems a bit
+	 * questionable but it's the historical behavior.)
+	 */
+	if (!pgsrt_save)
+	{
+		FreeFile(kfile);
+		return;
+	}
+
+	/*
+	 * Attempt to load old statistics from the dump file.
+	 */
+	file = AllocateFile(PGSRT_DUMP_FILE, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno != ENOENT)
+			goto read_error;
+		/* No existing persisted stats file, so we're done */
+		FreeFile(kfile);
+		return;
+	}
+
+	buffer_size = 2048;
+	buffer = (char *) palloc(buffer_size);
+
+	if (fread(&header, sizeof(uint32), 1, file) != 1 ||
+		fread(&pgver, sizeof(uint32), 1, file) != 1 ||
+		fread(&num, sizeof(int32), 1, file) != 1)
+		goto read_error;
+
+	if (header != PGSRT_FILE_HEADER ||
+		pgver != PGSRT_PG_MAJOR_VERSION)
+		goto data_error;
+
+	tottextlen = 0;
+	nvalidtexts = 0;
+
+	for (i = 0; i < num; i++)
+	{
+		pgsrtEntry	temp;
+		pgsrtEntry  *entry;
+		Size		keys_offset;
+
+		if (fread(&temp, sizeof(pgsrtEntry), 1, file) != 1)
+			goto read_error;
+
+		/* Encoding is the only field we can easily sanity-check */
+		if (!PG_VALID_BE_ENCODING(temp.encoding))
+			goto data_error;
+
+		/* Resize buffer as needed */
+		if (temp.keys_len >= buffer_size)
+		{
+			buffer_size = Max(buffer_size * 2, temp.keys_len + 1);
+			buffer = repalloc(buffer, buffer_size);
+		}
+
+		if (fread(buffer, 1, temp.keys_len + 1, file) != temp.keys_len + 1)
+			goto read_error;
+
+		/* Should have a trailing null, but let's make sure */
+		buffer[temp.keys_len] = '\0';
+
+		/* Store the keys text */
+		keys_offset = pgsrt->extent;
+		if (fwrite(buffer, 1, temp.keys_len + 1, kfile) != temp.keys_len + 1)
+			goto write_error;
+		pgsrt->extent += temp.keys_len + 1;
+
+		/* make the hashtable entry (discards old entries if too many) */
+		entry = pgsrt_entry_alloc(&temp.key, keys_offset, temp.keys_len,
+				temp.encoding, temp.nbkeys);
+
+		/* In the mean length computation, ignore dropped texts. */
+		if (entry->keys_len >= 0)
+		{
+			tottextlen += entry->keys_len + 1;
+			nvalidtexts++;
+		}
+
+		/* copy in the actual stats */
+		entry->counters = temp.counters;
+	}
+
+	if (nvalidtexts > 0)
+		pgsrt->mean_keys_len = tottextlen / nvalidtexts;
+	else
+		pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
+
+	pfree(buffer);
+	FreeFile(file);
+	FreeFile(kfile);
+
+	/*
+	 * Remove the persisted stats file so it's not included in
+	 * backups/replication slaves, etc.  A new file will be written on next
+	 * shutdown.
+	 *
+	 * Note: it's okay if the PGSRT_TEXT_FILE is included in a basebackup,
+	 * because we remove that file on startup; it acts inversely to
+	 * PGSRT_DUMP_FILE, in that it is only supposed to be around when the
+	 * server is running, whereas PGSRT_DUMP_FILE is only supposed to be around
+	 * when the server is not running.  Leaving the file creates no danger of
+	 * a newly restored database having a spurious record of execution costs,
+	 * which is what we're really concerned about here.
+	 */
+	unlink(PGSRT_DUMP_FILE);
+
+	return;
+
+read_error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not read file \"%s\": %m",
+					PGSRT_DUMP_FILE)));
+	goto fail;
+data_error:
+	ereport(LOG,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("ignoring invalid data in file \"%s\"",
+					PGSRT_DUMP_FILE)));
+	goto fail;
+write_error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not write file \"%s\": %m",
+					PGSRT_TEXT_FILE)));
+fail:
+	if (buffer)
+		pfree(buffer);
+	if (file)
+		FreeFile(file);
+	if (kfile)
+		FreeFile(kfile);
+	/* If possible, throw away the bogus file; ignore any error */
+	unlink(PGSRT_DUMP_FILE);
+
+	/*
+	 * Don't unlink PGSRT_TEXT_FILE here; it should always be around while the
+	 * server is running with pg_sortstats enabled
+	 */
 }
 
 /* Save the statistics into a file at shutdown */
 static void
 pgsrt_shmem_shutdown(int code, Datum arg)
 {
-	/* TODO */
-}
+	FILE	   *file;
+	char	   *kbuffer = NULL;
+	Size		kbuffer_size = 0;
+	HASH_SEQ_STATUS hash_seq;
+	int32		num_entries;
+	pgsrtEntry  *entry;
 
-void
-_PG_fini(void)
-{
-	/* Uninstall hooks. */
-	shmem_startup_hook = prev_shmem_startup_hook;
-	ExecutorStart_hook = prev_ExecutorStart;
-	ExecutorRun_hook = prev_ExecutorRun;
-	ExecutorFinish_hook = prev_ExecutorFinish;
-	ExecutorEnd_hook = prev_ExecutorEnd;
+	/* Don't try to dump during a crash. */
+	if (code)
+		return;
+
+	/* Safety check ... shouldn't get here unless shmem is set up. */
+	if (!pgsrt || !pgsrt_hash)
+		return;
+
+	/* Don't dump if told not to. */
+	if (!pgsrt_save)
+		return;
+
+	file = AllocateFile(PGSRT_DUMP_FILE ".tmp", PG_BINARY_W);
+	if (file == NULL)
+		goto error;
+
+	if (fwrite(&PGSRT_FILE_HEADER, sizeof(uint32), 1, file) != 1)
+		goto error;
+	if (fwrite(&PGSRT_PG_MAJOR_VERSION, sizeof(uint32), 1, file) != 1)
+		goto error;
+	num_entries = hash_get_num_entries(pgsrt_hash);
+	if (fwrite(&num_entries, sizeof(int32), 1, file) != 1)
+		goto error;
+
+	kbuffer = ktext_load_file(&kbuffer_size);
+	if (kbuffer == NULL)
+		goto error;
+
+	/*
+	 * When serializing to disk, we store keys texts immediately after their
+	 * entry data.  Any orphaned keys texts are thereby excluded.
+	 */
+	hash_seq_init(&hash_seq, pgsrt_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		int			len = entry->keys_len;
+		char	   *kstr = ktext_fetch(entry->keys_offset, len,
+									   kbuffer, kbuffer_size);
+
+		if (kstr == NULL)
+			continue;			/* Ignore any entries with bogus texts */
+
+		if (fwrite(entry, sizeof(pgsrtEntry), 1, file) != 1 ||
+			fwrite(kstr, 1, len + 1, file) != len + 1)
+		{
+			/* note: we assume hash_seq_term won't change errno */
+			hash_seq_term(&hash_seq);
+			goto error;
+		}
+	}
+
+	free(kbuffer);
+	kbuffer = NULL;
+
+	if (FreeFile(file))
+	{
+		file = NULL;
+		goto error;
+	}
+
+	/*
+	 * Rename file into place, so we atomically replace any old one.
+	 */
+	(void) durable_rename(PGSRT_DUMP_FILE ".tmp", PGSRT_DUMP_FILE, LOG);
+
+	/* Unlink keys-texts file; it's not needed while shutdown */
+	unlink(PGSRT_TEXT_FILE);
+
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not write file \"%s\": %m",
+					PGSRT_DUMP_FILE ".tmp")));
+	if (kbuffer)
+		free(kbuffer);
+	if (file)
+		FreeFile(file);
+	unlink(PGSRT_DUMP_FILE ".tmp");
+	unlink(PGSRT_TEXT_FILE);
 }
 
 /*
@@ -480,7 +832,8 @@ pgsrt_set_queryid(pgsrt_queryid queryId)
  * caller must hold an exclusive lock on pgsrt->lock
  */
 static pgsrtEntry *
-pgsrt_entry_alloc(pgsrtHashKey *key, char *keys)
+pgsrt_entry_alloc(pgsrtHashKey *key, Size keys_offset, int keys_len,
+		int encoding, int nbkeys)
 {
 	pgsrtEntry *entry;
 	bool		found;
@@ -500,9 +853,14 @@ pgsrt_entry_alloc(pgsrtHashKey *key, char *keys)
 		memset(&entry->counters, 0, sizeof(pgsrtCounters));
 		/* set the appropriate initial usage count */
 		entry->counters.usage = USAGE_INIT;
-		memcpy(entry->counters.keys, keys, PGSRT_KEYS_SIZE - 1);
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
+		/* set non counters fields */
+		Assert(keys_len >= 0);
+		entry->nbkeys = nbkeys;
+		entry->keys_offset = keys_offset;
+		entry->keys_len = keys_len;
+		entry->encoding = encoding;
 	}
 
 	return entry;
@@ -527,6 +885,7 @@ entry_cmp(const void *lhs, const void *rhs)
 
 /*
  * Deallocate least used entries.
+ *
  * Caller must hold an exclusive lock on pgsrt->lock.
  */
 static void
@@ -537,30 +896,52 @@ pgsrt_entry_dealloc(void)
 	pgsrtEntry  *entry;
 	int			nvictims;
 	int			i;
+	Size		tottextlen;
+	int			nvalidtexts;
 
 	/*
 	 * Sort entries by usage and deallocate USAGE_DEALLOC_PERCENT of them.
 	 * While we're scanning the table, apply the decay factor to the usage
 	 * values.
+	 *
+	 * Note that the mean query length is almost immediately obsolete, since
+	 * we compute it before not after discarding the least-used entries.
+	 * Hopefully, that doesn't affect the mean too much; it doesn't seem worth
+	 * making two passes to get a more current result.  Likewise, the new
+	 * cur_median_usage includes the entries we're about to zap.
 	 */
 	entries = palloc(hash_get_num_entries(pgsrt_hash) * sizeof(pgsrtEntry *));
 
 	i = 0;
+	tottextlen = 0;
+	nvalidtexts = 0;
+
 	hash_seq_init(&hash_seq, pgsrt_hash);
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
 	{
 		entries[i++] = entry;
 		entry->counters.usage *= USAGE_DECREASE_FACTOR;
+		/* In the mean length computation, ignore dropped texts. */
+		if (entry->keys_len >= 0)
+		{
+			tottextlen += entry->keys_len + 1;
+			nvalidtexts++;
+		}
 	}
 
+	/* Sort into increasing order by usage */
 	qsort(entries, i, sizeof(pgsrtEntry *), entry_cmp);
 
+	/* Record the (approximate) median usage */
 	if (i > 0)
-	{
-		/* Record the (approximate) median usage */
 		pgsrt->cur_median_usage = entries[i / 2]->counters.usage;
-	}
+	/* Record the mean query length */
+	if (nvalidtexts > 0)
+		pgsrt->mean_keys_len = tottextlen / nvalidtexts;
+	else
+		pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
 
+	/* Now zap an appropriate fraction of lowest-usage entries */
 	nvictims = Max(10, i * USAGE_DEALLOC_PERCENT / 100);
 	nvictims = Min(nvictims, i);
 
@@ -590,13 +971,19 @@ pgsrt_entry_reset(void)
 	LWLockRelease(pgsrt->lock);
 }
 
+
+/*
+ * Store some statistics for a sort.
+ */
 static void
-pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters)
+pgsrt_store(pgsrt_queryid queryId, int nbkeys, char *keys,
+		pgsrtCounters *counters)
 {
 	volatile pgsrtEntry *e;
-
 	pgsrtHashKey key;
 	pgsrtEntry  *entry;
+
+	Assert(keys != NULL);
 
 	/* Safety check... */
 	if (!pgsrt || !pgsrt_hash)
@@ -606,9 +993,8 @@ pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters)
 	key.userid = GetUserId();
 	key.dbid = MyDatabaseId;
 	key.queryid = queryId;
-	key.nbkeys = nbkeys;
-	key.sortid = (uint32) hash_any((unsigned char *) counters->keys,
-			strlen(counters->keys));
+	key.sortid = (uint32) hash_any((unsigned char *) keys,
+			strlen(keys));
 
 	/* Lookup the hash table entry with shared lock. */
 	LWLockAcquire(pgsrt->lock, LW_SHARED);
@@ -618,12 +1004,47 @@ pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters)
 	/* Create new entry, if not present */
 	if (!entry)
 	{
+		Size		keys_offset;
+		int			keys_len = strlen(keys);
+		int			gc_count;
+		bool		stored;
+		bool		do_gc;
+
+		/* Append new keys text to file with only shared lock held */
+		stored = ktext_store(keys, keys_len, &keys_offset, &gc_count);
+
+		/*
+		 * Determine whether we need to garbage collect external keys texts
+		 * while the shared lock is still held.  This micro-optimization
+		 * avoids taking the time to decide this while holding exclusive lock.
+		 */
+		do_gc = need_gc_ktexts();
+
 		/* Need exclusive lock to make a new hashtable entry - promote */
 		LWLockRelease(pgsrt->lock);
 		LWLockAcquire(pgsrt->lock, LW_EXCLUSIVE);
 
+		/*
+		 * A garbage collection may have occurred while we weren't holding the
+		 * lock.  In the unlikely event that this happens, the keys text we
+		 * stored above will have been garbage collected, so write it again.
+		 * This should be infrequent enough that doing it while holding
+		 * exclusive lock isn't a performance problem.
+		 */
+		if (!stored || pgsrt->gc_count != gc_count)
+			stored = ktext_store(keys, keys_len, &keys_offset, NULL);
+
+		/* If we failed to write to the text file, give up */
+		if (!stored)
+			goto done;
+
 		/* OK to create a new hashtable entry */
-		entry = pgsrt_entry_alloc(&key, counters->keys);
+		entry = pgsrt_entry_alloc(&key, keys_offset, keys_len,
+				GetDatabaseEncoding(), nbkeys);
+
+		/* If needed, perform garbage collection while exclusive lock held */
+		if (do_gc)
+			gc_ktexts();
 	}
 
 	/*
@@ -648,6 +1069,7 @@ pgsrt_entry_store(pgsrt_queryid queryId, int nbkeys, pgsrtCounters *counters)
 
 	SpinLockRelease(&e->mutex);
 
+done:
 	LWLockRelease(pgsrt->lock);
 }
 
@@ -660,7 +1082,6 @@ pgsrt_hash_fn(const void *key, Size keysize)
 	return hash_uint32((uint32) k->userid) ^
 		hash_uint32((uint32) k->dbid) ^
 		hash_uint32((uint32) k->queryid) ^
-		hash_uint32((uint32) k->nbkeys) ^
 		k->sortid;
 }
 
@@ -674,11 +1095,446 @@ pgsrt_match_fn(const void *key1, const void *key2, Size keysize)
 	if (k1->userid == k2->userid &&
 		k1->dbid == k2->dbid &&
 		k1->queryid == k2->queryid &&
-		k1->nbkeys == k2->nbkeys &&
 		k1->sortid == k2->sortid)
 		return 0;
 	else
 		return 1;
+}
+
+/*
+ * Given a keys string (not necessarily null-terminated), allocate a new
+ * entry in the external keys text file and store the string there.
+ *
+ * If successful, returns true, and stores the new entry's offset in the file
+ * into *keys_offset.  Also, if gc_count isn't NULL, *gc_count is set to the
+ * number of garbage collections that have occurred so far.
+ *
+ * On failure, returns false.
+ *
+ * At least a shared lock on pgsrt->lock must be held by the caller, so as
+ * to prevent a concurrent garbage collection.  Share-lock-holding callers
+ * should pass a gc_count pointer to obtain the number of garbage collections,
+ * so that they can recheck the count after obtaining exclusive lock to
+ * detect whether a garbage collection occurred (and removed this entry).
+ */
+static bool
+ktext_store(const char *keys, int keys_len,
+			Size *keys_offset, int *gc_count)
+{
+	Size		off;
+	int			fd;
+
+	/*
+	 * We use a spinlock to protect extent/n_writers/gc_count, so that
+	 * multiple processes may execute this function concurrently.
+	 */
+	{
+		volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt;
+
+		SpinLockAcquire(&s->mutex);
+		off = s->extent;
+		s->extent += keys_len + 1;
+		s->n_writers++;
+		if (gc_count)
+			*gc_count = s->gc_count;
+		SpinLockRelease(&s->mutex);
+	}
+
+	*keys_offset = off;
+
+	/* Now write the data into the successfully-reserved part of the file */
+#if PG_VERSION_NUM < 110000
+	fd = OpenTransientFile(PGSRT_TEXT_FILE, O_RDWR | O_CREAT | PG_BINARY,
+			S_IRUSR | S_IWUSR);
+#else
+	fd = OpenTransientFile(PGSRT_TEXT_FILE, O_RDWR | O_CREAT | PG_BINARY);
+#endif
+	if (fd < 0)
+		goto error;
+
+	if (lseek(fd, off, SEEK_SET) != off)
+		goto error;
+
+	if (write(fd, keys, keys_len) != keys_len)
+		goto error;
+	if (write(fd, "\0", 1) != 1)
+		goto error;
+
+	CloseTransientFile(fd);
+
+	/* Mark our write complete */
+	{
+		volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt;
+
+		SpinLockAcquire(&s->mutex);
+		s->n_writers--;
+		SpinLockRelease(&s->mutex);
+	}
+
+	return true;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not write file \"%s\": %m",
+					PGSRT_TEXT_FILE)));
+
+	if (fd >= 0)
+		CloseTransientFile(fd);
+
+	/* Mark our write complete */
+	{
+		volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt;
+
+		SpinLockAcquire(&s->mutex);
+		s->n_writers--;
+		SpinLockRelease(&s->mutex);
+	}
+
+	return false;
+}
+
+/*
+ * Read the external keys text file into a malloc'd buffer.
+ *
+ * Returns NULL (without throwing an error) if unable to read, eg
+ * file not there or insufficient memory.
+ *
+ * On success, the buffer size is also returned into *buffer_size.
+ *
+ * This can be called without any lock on pgsrt->lock, but in that case
+ * the caller is responsible for verifying that the result is sane.
+ */
+static char *
+ktext_load_file(Size *buffer_size)
+{
+	char	   *buf;
+	int			fd;
+	struct stat stat;
+
+#if PG_VERSION_NUM < 110000
+	fd = OpenTransientFile(PGSRT_TEXT_FILE, O_RDONLY | PG_BINARY, 0);
+#else
+	fd = OpenTransientFile(PGSRT_TEXT_FILE, O_RDONLY | PG_BINARY);
+#endif
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							PGSRT_TEXT_FILE)));
+		return NULL;
+	}
+
+	/* Get file length */
+	if (fstat(fd, &stat))
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m",
+						PGSRT_TEXT_FILE)));
+		CloseTransientFile(fd);
+		return NULL;
+	}
+
+	/* Allocate buffer; beware that off_t might be wider than size_t */
+	if (stat.st_size <= MaxAllocHugeSize)
+		buf = (char *) malloc(stat.st_size);
+	else
+		buf = NULL;
+	if (buf == NULL)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory"),
+				 errdetail("Could not allocate enough memory to read file \"%s\".",
+						   PGSRT_TEXT_FILE)));
+		CloseTransientFile(fd);
+		return NULL;
+	}
+
+	/*
+	 * OK, slurp in the file.  If we get a short read and errno doesn't get
+	 * set, the reason is probably that garbage collection truncated the file
+	 * since we did the fstat(), so we don't log a complaint --- but we don't
+	 * return the data, either, since it's most likely corrupt due to
+	 * concurrent writes from garbage collection.
+	 */
+	errno = 0;
+	if (read(fd, buf, stat.st_size) != stat.st_size)
+	{
+		if (errno)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							PGSRT_TEXT_FILE)));
+		free(buf);
+		CloseTransientFile(fd);
+		return NULL;
+	}
+
+	CloseTransientFile(fd);
+
+	*buffer_size = stat.st_size;
+	return buf;
+}
+
+/*
+ * Locate a keys text in the file image previously read by ktext_load_file().
+ *
+ * We validate the given offset/length, and return NULL if bogus.  Otherwise,
+ * the result points to a null-terminated string within the buffer.
+ */
+static char *
+ktext_fetch(Size keys_offset, int keys_len,
+			char *buffer, Size buffer_size)
+{
+	/* File read failed? */
+	if (buffer == NULL)
+		return NULL;
+	/* Bogus offset/length? */
+	if (keys_len < 0 ||
+		keys_offset + keys_len >= buffer_size)
+		return NULL;
+	/* As a further sanity check, make sure there's a trailing null */
+	if (buffer[keys_offset + keys_len] != '\0')
+		return NULL;
+	/* Looks OK */
+	return buffer + keys_offset;
+}
+
+/*
+ * Do we need to garbage-collect the external keys text file?
+ *
+ * Caller should hold at least a shared lock on pgsrt->lock.
+ */
+static bool
+need_gc_ktexts(void)
+{
+	Size		extent;
+
+	/* Read shared extent pointer */
+	{
+		volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt;
+
+		SpinLockAcquire(&s->mutex);
+		extent = s->extent;
+		SpinLockRelease(&s->mutex);
+	}
+
+	/* Don't proceed if file does not exceed 100 bytes per possible entry */
+	if (extent < 100 * pgsrt_max)
+		return false;
+
+	/*
+	 * Don't proceed if file is less than about 50% bloat.  Nothing can or
+	 * should be done in the event of unusually large keys texts accounting
+	 * for file's large size.  We go to the trouble of maintaining the mean
+	 * keys length in order to prevent garbage collection from thrashing
+	 * uselessly.
+	 */
+	if (extent < pgsrt->mean_keys_len * pgsrt_max * 2)
+		return false;
+
+	return true;
+}
+
+/*
+ * Garbage-collect orphaned keys texts in external file.
+ *
+ * This won't be called often in the typical case, since it's likely that
+ * there won't be too much churn, and besides, a similar compaction process
+ * occurs when serializing to disk at shutdown or as part of resetting.
+ * Despite this, it seems prudent to plan for the edge case where the file
+ * becomes unreasonably large, with no other method of compaction likely to
+ * occur in the foreseeable future.
+ *
+ * The caller must hold an exclusive lock on pgsrt->lock.
+ *
+ * At the first sign of trouble we unlink the keys text file to get a clean
+ * slate (although existing statistics are retained), rather than risk
+ * thrashing by allowing the same problem case to recur indefinitely.
+ */
+static void
+gc_ktexts(void)
+{
+	char	   *kbuffer;
+	Size		kbuffer_size;
+	FILE	   *kfile = NULL;
+	HASH_SEQ_STATUS hash_seq;
+	pgsrtEntry  *entry;
+	Size		extent;
+	int			nentries;
+
+	/*
+	 * When called from pgsrt_store, some other session might have proceeded
+	 * with garbage collection in the no-lock-held interim of lock strength
+	 * escalation.  Check once more that this is actually necessary.
+	 */
+	if (!need_gc_ktexts())
+		return;
+
+	/*
+	 * Load the old texts file.  If we fail (out of memory, for instance),
+	 * invalidate keys texts.  Hopefully this is rare.  It might seem better
+	 * to leave things alone on an OOM failure, but the problem is that the
+	 * file is only going to get bigger; hoping for a future non-OOM result is
+	 * risky and can easily lead to complete denial of service.
+	 */
+	kbuffer = ktext_load_file(&kbuffer_size);
+	if (kbuffer == NULL)
+		goto gc_fail;
+
+	/*
+	 * We overwrite the keys texts file in place, so as to reduce the risk of
+	 * an out-of-disk-space failure.  Since the file is guaranteed not to get
+	 * larger, this should always work on traditional filesystems; though we
+	 * could still lose on copy-on-write filesystems.
+	 */
+	kfile = AllocateFile(PGSRT_TEXT_FILE, PG_BINARY_W);
+	if (kfile == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m",
+						PGSRT_TEXT_FILE)));
+		goto gc_fail;
+	}
+
+	extent = 0;
+	nentries = 0;
+
+	hash_seq_init(&hash_seq, pgsrt_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		int			keys_len = entry->keys_len;
+		char	   *qry = ktext_fetch(entry->keys_offset,
+									  keys_len,
+									  kbuffer,
+									  kbuffer_size);
+
+		if (qry == NULL)
+		{
+			/* Trouble ... drop the text */
+			entry->keys_offset = 0;
+			entry->keys_len = -1;
+			/* entry will not be counted in mean keys length computation */
+			continue;
+		}
+
+		if (fwrite(qry, 1, keys_len + 1, kfile) != keys_len + 1)
+		{
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m",
+							PGSRT_TEXT_FILE)));
+			hash_seq_term(&hash_seq);
+			goto gc_fail;
+		}
+
+		entry->keys_offset = extent;
+		extent += keys_len + 1;
+		nentries++;
+	}
+
+	/*
+	 * Truncate away any now-unused space.  If this fails for some odd reason,
+	 * we log it, but there's no need to fail.
+	 */
+	if (ftruncate(fileno(kfile), extent) != 0)
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not truncate file \"%s\": %m",
+						PGSRT_TEXT_FILE)));
+
+	if (FreeFile(kfile))
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m",
+						PGSRT_TEXT_FILE)));
+		kfile = NULL;
+		goto gc_fail;
+	}
+
+	elog(DEBUG1, "pgsrt gc of keys file shrunk size from %zu to %zu",
+		 pgsrt->extent, extent);
+
+	/* Reset the shared extent pointer */
+	pgsrt->extent = extent;
+
+	/*
+	 * Also update the mean keys length, to be sure that need_gc_ktexts()
+	 * won't still think we have a problem.
+	 */
+	if (nentries > 0)
+		pgsrt->mean_keys_len = extent / nentries;
+	else
+		pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
+
+	free(kbuffer);
+
+	/*
+	 * OK, count a garbage collection cycle.  (Note: even though we have
+	 * exclusive lock on pgsrt->lock, we must take pgsrt->mutex for this, since
+	 * other processes may examine gc_count while holding only the mutex.
+	 * Also, we have to advance the count *after* we've rewritten the file,
+	 * else other processes might not realize they read a stale file.)
+	 */
+	record_gc_ktexts();
+
+	return;
+
+gc_fail:
+	/* clean up resources */
+	if (kfile)
+		FreeFile(kfile);
+	if (kbuffer)
+		free(kbuffer);
+
+	/*
+	 * Since the contents of the external file are now uncertain, mark all
+	 * hashtable entries as having invalid texts.
+	 */
+	hash_seq_init(&hash_seq, pgsrt_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		entry->keys_offset = 0;
+		entry->keys_len = -1;
+	}
+
+	/*
+	 * Destroy the keys text file and create a new, empty one
+	 */
+	(void) unlink(PGSRT_TEXT_FILE);
+	kfile = AllocateFile(PGSRT_TEXT_FILE, PG_BINARY_W);
+	if (kfile == NULL)
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not recreate file \"%s\": %m",
+						PGSRT_TEXT_FILE)));
+	else
+		FreeFile(kfile);
+
+	/* Reset the shared extent pointer */
+	pgsrt->extent = 0;
+
+	/* Reset mean_keys_len to match the new state */
+	pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
+
+	/*
+	 * Bump the GC count even though we failed.
+	 *
+	 * This is needed to make concurrent readers of file without any lock on
+	 * pgsrt->lock notice existence of new version of file.  Once readers
+	 * subsequently observe a change in GC count with pgsrt->lock held, that
+	 * forces a safe reopen of file.  Writers also require that we bump here,
+	 * of course.  (As required by locking protocol, readers and writers don't
+	 * trust earlier file contents until gc_count is found unchanged after
+	 * pgsrt->lock acquired in shared or exclusive mode respectively.)
+	 */
+	record_gc_ktexts();
 }
 
 static void
@@ -865,15 +1721,12 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	counters.nb_workers = 0;
 #endif
 
-	memset(counters.keys, 0, PGSRT_KEYS_SIZE);
-	memcpy(counters.keys, deparsed, PGSRT_KEYS_SIZE - 1);
-
 	if (IsParallelWorker())
 		queryId = pgsrt_get_queryid();
 	else
 		queryId = context->queryDesc->plannedstmt->queryId;
 
-	pgsrt_entry_store(queryId, sort->numCols, &counters);
+	pgsrt_store(queryId, sort->numCols, deparsed, &counters);
 
 	//elog(WARNING, "sort info:\n"
 	//		"keys: %s\n"
@@ -1009,11 +1862,16 @@ pg_sortstats_reset(PG_FUNCTION_ARGS)
 Datum
 pg_sortstats(PG_FUNCTION_ARGS)
 {
-	ReturnSetInfo	*rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	bool			showtext = PG_GETARG_BOOL(0);
+	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	MemoryContext	per_query_ctx;
 	MemoryContext	oldcontext;
 	TupleDesc		tupdesc;
 	Tuplestorestate	*tupstore;
+	char		   *kbuffer = NULL;
+	Size			kbuffer_size = 0;
+	Size			extent = 0;
+	int				gc_count = 0;
 	HASH_SEQ_STATUS hash_seq;
 	pgsrtEntry		*entry;
 
@@ -1048,7 +1906,70 @@ pg_sortstats(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
+	/*
+	 * We'd like to load the keys text file (if needed) while not holding any
+	 * lock on pgsrt->lock.  In the worst case we'll have to do this again
+	 * after we have the lock, but it's unlikely enough to make this a win
+	 * despite occasional duplicated work.  We need to reload if anybody
+	 * writes to the file (either a retail ktext_store(), or a garbage
+	 * collection) between this point and where we've gotten shared lock.  If
+	 * a ktext_store is actually in progress when we look, we might as well
+	 * skip the speculative load entirely.
+	 */
+	if (showtext)
+	{
+		int			n_writers;
+
+		/* Take the mutex so we can examine variables */
+		{
+			volatile pgsrtSharedState *s = (volatile pgsrtSharedState *) pgsrt;
+
+			SpinLockAcquire(&s->mutex);
+			extent = s->extent;
+			n_writers = s->n_writers;
+			gc_count = s->gc_count;
+			SpinLockRelease(&s->mutex);
+		}
+
+		/* No point in loading file now if there are active writers */
+		if (n_writers == 0)
+			kbuffer = ktext_load_file(&kbuffer_size);
+	}
+
+	/*
+	 * Get shared lock, load or reload the keys text file if we must, and
+	 * iterate over the hashtable entries.
+	 *
+	 * With a large hash table, we might be holding the lock rather longer
+	 * than one could wish.  However, this only blocks creation of new hash
+	 * table entries, and the larger the hash table the less likely that is to
+	 * be needed.  So we can hope this is okay.  Perhaps someday we'll decide
+	 * we need to partition the hash table to limit the time spent holding any
+	 * one lock.
+	 */
 	LWLockAcquire(pgsrt->lock, LW_SHARED);
+
+	if (showtext)
+	{
+		/*
+		 * Here it is safe to examine extent and gc_count without taking the
+		 * mutex.  Note that although other processes might change
+		 * pgsrt->extent just after we look at it, the strings they then write
+		 * into the file cannot yet be referenced in the hashtable, so we
+		 * don't care whether we see them or not.
+		 *
+		 * If ktext_load_file fails, we just press on; we'll return NULL for
+		 * every keys text.
+		 */
+		if (kbuffer == NULL ||
+			pgsrt->extent != extent ||
+			pgsrt->gc_count != gc_count)
+		{
+			if (kbuffer)
+				free(kbuffer);
+			kbuffer = ktext_load_file(&kbuffer_size);
+		}
+	}
 
 	hash_seq_init(&hash_seq, pgsrt_hash);
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
@@ -1073,8 +1994,38 @@ pg_sortstats(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(entry->key.queryid);
 		values[i++] = ObjectIdGetDatum(entry->key.userid);
 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
-		values[i++] = Int32GetDatum(entry->key.nbkeys);
-		values[i++] = CStringGetTextDatum(tmp.keys);
+		values[i++] = Int32GetDatum(entry->nbkeys);
+		if (showtext)
+		{
+			char	   *kstr = ktext_fetch(entry->keys_offset,
+					entry->keys_len,
+					kbuffer,
+					kbuffer_size);
+
+			if (kstr)
+			{
+				char	   *enc;
+
+				enc = pg_any_to_server(kstr,
+						entry->keys_len,
+						entry->encoding);
+
+				values[i++] = CStringGetTextDatum(enc);
+
+				if (enc != kstr)
+					pfree(enc);
+				}
+				else
+				{
+					/* Just return a null if we fail to find the text */
+					nulls[i++] = true;
+				}
+		}
+		else
+		{
+			/* keys text not requested */
+			nulls[i++] = true;
+		}
 		values[i++] = Int64GetDatumFast(tmp.lines);
 		values[i++] = Int64GetDatumFast(tmp.lines_to_sort);
 		values[i++] = Int64GetDatumFast(tmp.work_mems);
@@ -1097,9 +2048,12 @@ pg_sortstats(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
+	/* clean up and return the tuplestore */
 	LWLockRelease(pgsrt->lock);
 
-	/* clean up and return the tuplestore */
+	if (kbuffer)
+		free(kbuffer);
+
 	tuplestore_donestoring(tupstore);
 	return (Datum) 0;
 }
