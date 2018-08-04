@@ -422,6 +422,9 @@ pgsrt_memsize(void)
 
 	size = MAXALIGN(sizeof(pgsrtSharedState));
 	size = add_size(size, hash_estimate_size(pgsrt_max, sizeof(pgsrtEntry)));
+#if PG_VERSION_NUM >= 90600
+	size = add_size(size, pgsrt_queryids_size());
+#endif
 
 	return size;
 }
