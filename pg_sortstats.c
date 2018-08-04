@@ -304,7 +304,7 @@ _PG_init(void)
 #if PG_VERSION_NUM >= 90600
 	RequestNamedLWLockTranche("pg_sortstats", 2);
 #else
-	RequestAddinLWLocks(2);
+	RequestAddinLWLocks(1);
 #endif
 
 	/* install hooks */
@@ -375,7 +375,6 @@ pgsrt_shmem_startup(void)
 		memset(pgsrt->queryids, 0, pgsrt_queryids_size());
 #else
 		pgsrt->lock = LWLockAssign();
-		pgsrt->queryids_lock = LWLockAssign();
 #endif
 		pgsrt->cur_median_usage = ASSUMED_MEDIAN_INIT;
 		pgsrt->mean_keys_len = ASSUMED_LENGTH_INIT;
@@ -666,8 +665,10 @@ error:
 static void
 pgsrt_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+#if PG_VERSION_NUM >= 90600
 	if (pgsrt_enabled && !IsParallelWorker())
 		pgsrt_set_queryid(queryDesc->plannedstmt->queryId);
+#endif
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -756,9 +757,11 @@ pgsrt_ExecutorEnd(QueryDesc *queryDesc)
 
 		pgsrt_planstate_walker(queryDesc->planstate, &context);
 
+#if PG_VERSION_NUM >= 90600
 		/* Remove the saved queryid for safety */
 		if (!IsParallelWorker())
 			pgsrt_set_queryid(0);
+#endif
 	}
 
 	if (prev_ExecutorEnd)
@@ -1721,10 +1724,14 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	counters.nb_workers = 0;
 #endif
 
+#if PG_VERSION_NUM >= 90600
 	if (IsParallelWorker())
 		queryId = pgsrt_get_queryid();
 	else
 		queryId = context->queryDesc->plannedstmt->queryId;
+#else
+	queryId = context->queryDesc->plannedstmt->queryId;
+#endif
 
 	pgsrt_store(queryId, sort->numCols, deparsed, &counters);
 
