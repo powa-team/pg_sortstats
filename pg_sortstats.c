@@ -35,6 +35,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "access/hash.h"
+#include "access/htup_details.h"
 #if PG_VERSION_NUM >= 90600
 #include "access/parallel.h"
 #endif
@@ -102,6 +103,12 @@ static const uint32 PGSRT_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 		s->gc_count++; \
 		SpinLockRelease(&s->mutex); \
 	} while(0)
+
+/* Hardcode some magic values not exported */
+
+/* from aset.c */
+#define PGSRT_ALLOC_CHUNKHDRSZ		24
+#define PGSRT_SIZEOF_SORTTUPLE		24
 
 /* In PostgreSQL 11, queryid becomes a uint64 internally.
  */
@@ -237,6 +244,8 @@ static char * pgsrt_get_sort_group_keys(SortState *srtstate,
 					 Oid *sortOperators, Oid *collations, bool *nullsFirst,
 					 pgsrtWalkerContext *context);
 static void pgsrt_setup_walker_context(pgsrtWalkerContext *context);
+
+static unsigned long round_up_pow2(int64 val);
 
 /*--- Local variables ---*/
 static int nesting_level = 0;
@@ -1559,27 +1568,18 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 #endif
 	long		spaceUsed;
 	bool found;
-	int mem_per_row;
-	int64 lines, lines_to_sort, w_m;
-	int tuple_palloc;
-	int i;
+	int memtupsize_palloc;		/* tuplesort's main storage total size,
+								   including palloc overhead */
+	int tuple_palloc;			/* average tuple size, including palloc overhead */
+	int64 lines,				/* number of lines underlying node returned */
+		  lines_to_sort,		/* number of lines the sort will actually
+								   process (may differ when bounded) */
+		  memtupsize_length,	/* tuplesort's main storage array size */
+		  w_m;					/* estimated work_mem */
 
 	Assert(state);
 
-	/*
-	 * Estimate the per-line space used.  We use the average row width, and add
-	 * the fixed 16B palloc overhead
-	 */
-	tuple_palloc = sort->plan.plan_width + 16;
-
-	/*
-	 * Each tuple is palloced, and a palloc chunk always uses a 2^N size
-	 */
-	i = 1;
-	while (tuple_palloc > i)
-		i *=2;
-	tuple_palloc = i;
-
+	/* First estimate the size of the main array that stores the lines */
 	lines = 0;
 	/* get effective number of lines fed to the sort if available */
 	if (srtstate->ss.ps.instrument)
@@ -1598,21 +1598,50 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	else
 		lines_to_sort = lines;
 
+	/* The minimal memtupsize is 1024 */
+	memtupsize_length = Max(1024, lines_to_sort);
 	/*
-	 * compute the per-row space needed. The involved struct aren't
-	 * exported, so just use raw number instead. FTR, the formula:
-	 * sizeof(SortTuple) + sizeof(MinimalTuple) + sizeof(AllocChunkData) + tuple_palloc
-	 * */
-	mem_per_row = 24 + 8 + 16 + tuple_palloc;
-	w_m = lines_to_sort * mem_per_row;
+	 * growth is done by doubling the size each time
+	 * FIXME: implement the last growth special rule
+	 */
+	memtupsize_length = round_up_pow2(memtupsize_length);
+
+	/* compute the memtupsize palloc size */
+	memtupsize_palloc = PGSRT_SIZEOF_SORTTUPLE * memtupsize_length;
+	memtupsize_palloc += PGSRT_ALLOC_CHUNKHDRSZ;
+
+	/*
+	 * Then estimate the per-line space used.  We use the average row width,
+	 * and add the fixed MnimalTuple header overhead
+	 * FIXME: take into account NULLs, OIDs and alignment lost bytes
+	 */
+	tuple_palloc = sort->plan.plan_width + MAXALIGN(SizeofMinimalTupleHeader);
+
+	/*
+	 * Each tuple is palloced, and a palloc chunk always uses a 2^N size
+	 */
+	tuple_palloc = round_up_pow2(tuple_palloc);
+
+	/* Add the palloc overhead */
+	tuple_palloc += PGSRT_ALLOC_CHUNKHDRSZ;
+
+	/*
+	 * compute the estimated total work_mem that's needed to perform the
+	 * sort in memory.  First add the space needed for the lines
+	 */
+	w_m = lines_to_sort * tuple_palloc;
 
 	/*
 	 * If a bounded sort was asked, we'll try to sort only the bound limit
-	 * number of line, but a Top-N heapsort needs to be able to store twice the
-	 * amount of rows, so twice the memory is needed.
+	 * number of line, but a Top-N heapsort may need to be able to store twice
+	 * the amount of rows, so use twice the memory, assuming that the worst
+	 * case always happens.
 	 */
 	if (srtstate->bounded)
 		w_m *= 2;
+
+	/* add the tuplesort's main array storage and we're done */
+	w_m += memtupsize_palloc;
 
 	/* convert in kB, and add 1 kB as a quick round up */
 	w_m /= 1024;
@@ -2063,4 +2092,17 @@ pg_sortstats(PG_FUNCTION_ARGS)
 
 	tuplestore_donestoring(tupstore);
 	return (Datum) 0;
+}
+
+static unsigned long
+round_up_pow2(int64 val)
+{
+	val--;
+	val |= val >> 1;
+	val |= val >> 2;
+	val |= val >> 4;
+	val |= val >> 8;
+	val |= val >> 16;
+	val++;
+	return val;
 }
