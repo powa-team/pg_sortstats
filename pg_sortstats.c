@@ -104,11 +104,7 @@ static const uint32 PGSRT_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 		SpinLockRelease(&s->mutex); \
 	} while(0)
 
-/* Hardcode some magic values not exported */
 
-/* from aset.c */
-#define PGSRT_ALLOC_CHUNKHDRSZ		24
-#define PGSRT_SIZEOF_SORTTUPLE		24
 
 /* In PostgreSQL 11, queryid becomes a uint64 internally.
  */
@@ -1601,8 +1597,10 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	/* The minimal memtupsize is 1024 */
 	memtupsize_length = Max(1024, lines_to_sort);
 	/*
-	 * growth is done by doubling the size each time
-	 * FIXME: implement the last growth special rule
+	 * growth is done by doubling the size each time with a minimum of 1024
+	 * entries, so we'll have a power of 2.  No need to deal with the the last
+	 * growth special rule, there's no way we can exhaust the work_mem for the
+	 * main array and still put all the rows to sort in memory
 	 */
 	memtupsize_length = round_up_pow2(memtupsize_length);
 
@@ -1618,9 +1616,11 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	tuple_palloc = sort->plan.plan_width + MAXALIGN(SizeofMinimalTupleHeader);
 
 	/*
-	 * Each tuple is palloced, and a palloc chunk always uses a 2^N size
+	 * Each tuple is palloced, and a palloced chunk uses a 2^N size unless size
+	 * is more then PGSRT_ALLOC_CHUNK_LIMIT
 	 */
-	tuple_palloc = round_up_pow2(tuple_palloc);
+	if (tuple_palloc < PGSRT_ALLOC_CHUNK_LIMIT)
+		tuple_palloc = round_up_pow2(tuple_palloc);
 
 	/* Add the palloc overhead */
 	tuple_palloc += PGSRT_ALLOC_CHUNKHDRSZ;

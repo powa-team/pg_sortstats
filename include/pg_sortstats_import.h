@@ -23,6 +23,14 @@
 #error "PostgreSQL version not supported"
 #endif
 
+/* Hardcode some magic values not exported */
+#define PGSRT_SIZEOF_SORTTUPLE		24
+/* from aset.c */
+#define PGSRT_ALLOC_CHUNKHDRSZ		24
+#define PGSRT_ALLOC_MINBITS		3	/* smallest chunk size is 8 bytes */
+#define PGSRT_ALLOCSET_NUM_FREELISTS	11
+#define PGSRT_ALLOC_CHUNK_LIMIT	(1 << (PGSRT_ALLOCSET_NUM_FREELISTS-1+PGSRT_ALLOC_MINBITS))
+
 bool pgsrt_PreScanNode(PlanState *planstate, Bitmapset **rels_used);
 void pgsrt_show_sortorder_options(StringInfo buf, Node *sortexpr,
 					   Oid sortOperator, Oid collation, bool nullsFirst);
