@@ -1,6 +1,45 @@
 #ifndef PG_SORTSTATS_IMPORT_PG12_H
 #define PG_SORTSTATS_IMPORT_PG12_H
 
+#define PGSRT_ALLOC_CHUNKHDRSZ	sizeof(struct pgsrt_AllocChunkData)
+
+/*
+ * AllocChunk
+ *		The prefix of each piece of memory in an AllocBlock
+ *
+ * Note: to meet the memory context APIs, the payload area of the chunk must
+ * be maxaligned, and the "aset" link must be immediately adjacent to the
+ * payload area (cf. GetMemoryChunkContext).  We simplify matters for this
+ * module by requiring sizeof(AllocChunkData) to be maxaligned, and then
+ * we can ensure things work by adding any required alignment padding before
+ * the "aset" field.  There is a static assertion below that the alignment
+ * is done correctly.
+ */
+typedef struct pgsrt_AllocChunkData
+{
+	/* size is always the size of the usable space in the chunk */
+	Size		size;
+#ifdef MEMORY_CONTEXT_CHECKING
+	/* when debugging memory usage, also store actual requested size */
+	/* this is zero in a free chunk */
+	Size		requested_size;
+
+#define ALLOCCHUNK_RAWSIZE  (SIZEOF_SIZE_T * 2 + SIZEOF_VOID_P)
+#else
+#define ALLOCCHUNK_RAWSIZE  (SIZEOF_SIZE_T + SIZEOF_VOID_P)
+#endif							/* MEMORY_CONTEXT_CHECKING */
+
+	/* ensure proper alignment by adding padding if needed */
+#if (ALLOCCHUNK_RAWSIZE % MAXIMUM_ALIGNOF) != 0
+	char		padding[MAXIMUM_ALIGNOF - ALLOCCHUNK_RAWSIZE % MAXIMUM_ALIGNOF];
+#endif
+
+	/* aset is the owning aset if allocated, or the freelist link if free */
+	void	   *aset;
+	/* there must not be any padding to reach a MAXALIGN boundary here! */
+}			pgsrt_AllocChunkData;
+
+
 #define SLAB_SLOT_SIZE 1024
 typedef union SlabSlot
 {

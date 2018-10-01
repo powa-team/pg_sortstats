@@ -23,10 +23,10 @@
 #error "PostgreSQL version not supported"
 #endif
 
-/* Hardcode some magic values not exported */
-#define PGSRT_SIZEOF_SORTTUPLE		24
-/* from aset.c */
-#define PGSRT_ALLOC_CHUNKHDRSZ		24
+/*
+ * Import some define that are stable enough so that we don't need a
+ * per-major-version definition
+ */
 #define PGSRT_ALLOC_MINBITS		3	/* smallest chunk size is 8 bytes */
 #define PGSRT_ALLOCSET_NUM_FREELISTS	11
 #define PGSRT_ALLOC_CHUNK_LIMIT	(1 << (PGSRT_ALLOCSET_NUM_FREELISTS-1+PGSRT_ALLOC_MINBITS))

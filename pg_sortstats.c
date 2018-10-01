@@ -1605,7 +1605,7 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	memtupsize_length = round_up_pow2(memtupsize_length);
 
 	/* compute the memtupsize palloc size */
-	memtupsize_palloc = PGSRT_SIZEOF_SORTTUPLE * memtupsize_length;
+	memtupsize_palloc = sizeof(SortTuple) * memtupsize_length;
 	memtupsize_palloc += PGSRT_ALLOC_CHUNKHDRSZ;
 
 	/*
