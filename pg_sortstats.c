@@ -242,6 +242,7 @@ static char * pgsrt_get_sort_group_keys(SortState *srtstate,
 static void pgsrt_setup_walker_context(pgsrtWalkerContext *context);
 
 static unsigned long round_up_pow2(int64 val);
+static int get_alignment_overhead(TupleDesc tupdesc);
 
 /*--- Local variables ---*/
 static int nesting_level = 0;
@@ -1615,6 +1616,9 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	 */
 	tuple_palloc = sort->plan.plan_width + MAXALIGN(SizeofMinimalTupleHeader);
 
+	/* Add lost space due to alignment */
+	tuple_palloc += get_alignment_overhead(srtstate->ss.ps.scandesc);
+
 	/*
 	 * Each tuple is palloced, and a palloced chunk uses a 2^N size unless size
 	 * is more then PGSRT_ALLOC_CHUNK_LIMIT
@@ -2105,4 +2109,33 @@ round_up_pow2(int64 val)
 	val |= val >> 16;
 	val++;
 	return val;
+}
+
+static int
+get_alignment_overhead(TupleDesc tupdesc)
+{
+	int align_overhead = 0;
+	int off = 0;
+	int i;
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		int newoff;
+
+		/* FIXME use better heuristic for varlena :) */
+		if (attr->attlen > 0)
+			off += attr->attlen;
+		else
+			off += 1;
+
+		newoff = att_align_nominal(off, attr->attalign);
+		if (newoff != off)
+		{
+			align_overhead += (newoff - off);
+			off = newoff;
+		}
+	}
+
+	return align_overhead;
 }
