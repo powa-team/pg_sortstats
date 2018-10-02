@@ -2,7 +2,7 @@ pg_sortstats
 ============
 
 PostgreSQL extension to gather statistics about sorts, and estimate how much
-work\_mem would be needed to hame the sort done in memory.
+work\_mem would be needed to have the sort done in memory.
 
 The `pg_sortstats()` set-returning functions provides the following fields:
 
