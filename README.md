@@ -1,8 +1,8 @@
 pg_sortstats
 ============
 
-** /!\ This extension is under development and not production ready.  Use at
-your own risk. /!\ **
+**/!\ This extension is under development and not production ready.  Use at
+your own risk.**
 
 PostgreSQL extension to gather and cumulate various statistics about sorts, and
 estimate how much work\_mem would be needed to have the sort done in memory.
