@@ -1,6 +1,7 @@
 #ifndef PG_SORTSTATS_IMPORT_PG9_4_H
 #define PG_SORTSTATS_IMPORT_PG9_4_H
 
+#define SizeofMinimalTupleHeader offsetof(MinimalTupleData, t_bits)
 /*
  * AllocChunk
  *		The prefix of each piece of memory in an AllocBlock

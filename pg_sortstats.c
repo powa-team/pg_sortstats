@@ -1718,7 +1718,12 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	else
 		counters.external_merges = 0;
 
-	Assert(found);
+	if (!found)
+#if PG_VERSION_NUM >= 110000
+		elog(ERROR, "Unexpected sort method: %d", stats.sortMethod);
+#else
+		elog(ERROR, "Unexpected sort method: %s", sortMethod);
+#endif
 
 	counters.nbtapes = nbtapes;
 
@@ -1919,7 +1924,7 @@ pg_sortstats(PG_FUNCTION_ARGS)
 	if (!pgsrt)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_stat_kcache must be loaded via shared_preload_libraries")));
+				 errmsg("pg_sortstats must be loaded via shared_preload_libraries")));
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
