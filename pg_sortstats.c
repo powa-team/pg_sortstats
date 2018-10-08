@@ -1617,7 +1617,7 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 	tuple_palloc = sort->plan.plan_width + MAXALIGN(SizeofMinimalTupleHeader);
 
 	/* Add lost space due to alignment */
-	tuple_palloc += get_alignment_overhead(srtstate->ss.ps.scandesc);
+	tuple_palloc += get_alignment_overhead(srtstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
 
 	/*
 	 * Each tuple is palloced, and a palloced chunk uses a 2^N size unless size
