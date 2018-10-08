@@ -31,6 +31,8 @@ RETURNS SETOF record
 AS '$libdir/pg_sortstats', 'pg_sortstats'
 LANGUAGE C STRICT VOLATILE COST 1000;
 
+CREATE VIEW pg_sortstats AS SELECT * FROM pg_sortstats(true);
+
 CREATE FUNCTION pg_sortstats_reset()
     RETURNS void
 LANGUAGE c COST 1000
