@@ -67,7 +67,7 @@ typedef enum
 	TSS_FINALMERGE				/* Performing final merge on-the-fly */
 } TupSortStatus;
 
-struct pgsrt_Tuplesortstate
+typedef struct pgsrt_Tuplesortstate
 {
 	TupSortStatus status;		/* enumerated value as shown above */
 	int			nKeys;			/* number of columns in sort key */

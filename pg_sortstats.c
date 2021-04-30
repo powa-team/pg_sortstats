@@ -1712,7 +1712,7 @@ pgsrt_process_sortstate(SortState *srtstate, pgsrtWalkerContext *context)
 #endif
 	{
 		counters.external_merges = 1;
-		nbtapes = ((struct pgsrt_Tuplesortstate *) state)->currentRun + 1;
+		nbtapes = ((pgsrt_Tuplesortstate *) state)->currentRun + 1;
 		found = true;
 	}
 	else
