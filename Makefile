@@ -1,8 +1,7 @@
 EXTENSION    = pg_sortstats
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
-TESTS        = $(wildcard sql/*.sql)
-REGRESS      = $(patsubst sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test
+REGRESS      = pg_sortstats # Can be overloaded later
 
 PG_CONFIG    ?= pg_config
 
@@ -23,3 +22,8 @@ release-zip: all
 DATA = $(wildcard *--*.sql)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Change the regression test for pg12+
+ifneq ($(MAJORVERSION),$(filter $(MAJORVERSION), 9.2 9.3 9.4 9.5 9.6 10 11))
+	REGRESS = pg_sortstats_12
+endif
