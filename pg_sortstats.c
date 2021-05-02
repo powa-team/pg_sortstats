@@ -818,7 +818,7 @@ pgsrt_get_queryid(void)
 	Assert(MyBackendId <= PGSRT_NB_BACKEND_SLOT);
 
 	LWLockAcquire(pgsrt->queryids_lock, LW_SHARED);
-	queryId = pgsrt->queryids[ParallelMasterBackendId];
+	queryId = pgsrt->queryids[ParallelLeaderBackendId];
 	LWLockRelease(pgsrt->queryids_lock);
 
 	return queryId;

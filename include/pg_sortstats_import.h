@@ -21,8 +21,14 @@
 #include "include/pg_sortstats_import_pg12.h"
 #elif PG_VERSION_NUM >= 130000 && PG_VERSION_NUM < 140000
 #include "include/pg_sortstats_import_pg13.h"
+#elif PG_VERSION_NUM >= 140000 && PG_VERSION_NUM < 150000
+#include "include/pg_sortstats_import_pg14.h"
 #else
 #error "PostgreSQL version not supported"
+#endif
+
+#if PG_VERSION_NUM < 140000
+#define ParallelLeaderBackendId		ParallelMasterBackendId
 #endif
 
 /*
