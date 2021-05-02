@@ -1829,8 +1829,14 @@ pgsrt_setup_walker_context(pgsrtWalkerContext *context)
 	pgsrt_PreScanNode(context->queryDesc->planstate, &rels_used);
 	context->rtable_names = select_rtable_names_for_explain(context->rtable,
 			rels_used);
+#if PG_VERSION_NUM < 130000
 	context->deparse_cxt = deparse_context_for_plan_rtable(context->rtable,
 			context->rtable_names);
+#else
+	context->deparse_cxt = deparse_context_for_plan_tree(
+			context->queryDesc->plannedstmt,
+			context->rtable_names);
+#endif
 }
 
 /* Adapted from show_sort_group_keys */
@@ -1854,9 +1860,15 @@ pgsrt_get_sort_group_keys(SortState *srtstate,
 	initStringInfo(&sortkeybuf);
 
 	/* Set up deparsing context */
+#if PG_VERSION_NUM < 130000
 	dp_context = set_deparse_context_planstate(context->deparse_cxt,
 											(Node *) srtstate,
 											context->ancestors);
+#else
+	dp_context = set_deparse_context_plan(context->deparse_cxt,
+										  plan,
+										  context->ancestors);
+#endif
 	useprefix = (list_length(context->rtable) > 1);
 
 	for (keyno = 0; keyno < nkeys; keyno++)

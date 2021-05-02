@@ -19,6 +19,8 @@
 #include "include/pg_sortstats_import_pg11.h"
 #elif PG_VERSION_NUM >= 120000 && PG_VERSION_NUM < 130000
 #include "include/pg_sortstats_import_pg12.h"
+#elif PG_VERSION_NUM >= 130000 && PG_VERSION_NUM < 140000
+#include "include/pg_sortstats_import_pg13.h"
 #else
 #error "PostgreSQL version not supported"
 #endif
