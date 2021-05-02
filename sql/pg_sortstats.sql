@@ -2,13 +2,13 @@ CREATE EXTENSION pg_sortstats;
 
 SELECT pg_sortstats_reset();
 
-CREATE TABLE sorts (id integer, val text);
+CREATE TABLE sorts (id integer, val text COLLATE "C");
 INSERT INTO sorts SELECT i, 'line ' || i FROM generate_series(1, 100000) i;
 VACUUM ANALYZE sorts;
 
 SET work_mem = '64kB';
 WITH src AS (
-    SELECT * FROM sorts ORDER BY val COLLATE "C", id DESC
+    SELECT * FROM sorts ORDER BY val, id DESC
 )
 SELECT * FROM src LIMIT 1;
 SELECT * FROM sorts ORDER BY id DESC LIMIT 1;
@@ -26,7 +26,7 @@ SELECT pg_sortstats_reset();
 
 SET work_mem = '12MB';
 WITH src AS (
-    SELECT * FROM sorts ORDER BY val COLLATE "C", id DESC
+    SELECT * FROM sorts ORDER BY val, id DESC
 )
 SELECT * FROM src LIMIT 1;
 
