@@ -45,6 +45,9 @@
 #if PG_VERSION_NUM >= 90600
 #include "postmaster/autovacuum.h"
 #endif
+#if PG_VERSION_NUM >= 120000
+#include "replication/walsender.h"
+#endif
 #if PG_VERSION_NUM < 100000
 #include "storage/fd.h"
 #endif
@@ -786,13 +789,22 @@ pgsrt_memsize(void)
 static Size
 pgsrt_queryids_size(void)
 {
+#if PG_VERSION_NUM >= 120000
 	/* We need frrom for all possible backends, plus the autovacuum launcher
 	 * and workers, plus the background workers, and an extra one since
 	 * BackendId numerotation starts at 1.
+	 * Starting with pg12, wal senders aren't part of MaxConnections anymore,
+	 * so they need to be accounted for.
 	 */
 #define PGSRT_NB_BACKEND_SLOT (MaxConnections \
 			 + autovacuum_max_workers + 1 \
+			 + max_worker_processes \
+			 + max_wal_senders + 1)
+#else
+#define PGSRT_NB_BACKEND_SLOT (MaxConnections \
+			 + autovacuum_max_workers + 1 \
 			 + max_worker_processes + 1)
+#endif
 
 	return MAXALIGN(sizeof(pgsrt_queryid) * PGSRT_NB_BACKEND_SLOT);
 }
