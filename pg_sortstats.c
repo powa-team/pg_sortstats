@@ -177,7 +177,6 @@ typedef struct pgsrtWalkerContext
 /*--- Function declarations ---*/
 
 void		_PG_init(void);
-void		_PG_fini(void);
 
 
 extern PGDLLEXPORT Datum	pg_sortstats(PG_FUNCTION_ARGS);
@@ -324,17 +323,6 @@ _PG_init(void)
 	ExecutorEnd_hook = pgsrt_ExecutorEnd;
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgsrt_shmem_startup;
-}
-
-void
-_PG_fini(void)
-{
-	/* Uninstall hooks. */
-	shmem_startup_hook = prev_shmem_startup_hook;
-	ExecutorStart_hook = prev_ExecutorStart;
-	ExecutorRun_hook = prev_ExecutorRun;
-	ExecutorFinish_hook = prev_ExecutorFinish;
-	ExecutorEnd_hook = prev_ExecutorEnd;
 }
 
 static void
