@@ -188,6 +188,9 @@ extern PGDLLEXPORT Datum	pg_sortstats_reset(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pg_sortstats);
 PG_FUNCTION_INFO_V1(pg_sortstats_reset);
 
+#if PG_VERSION_NUM >= 150000
+static void pgsrt_shmem_request(void);
+#endif
 static void pgsrt_shmem_startup(void);
 static void pgsrt_shmem_shutdown(int code, Datum arg);
 static void pgsrt_ExecutorStart(QueryDesc *queryDesc, int eflags);
@@ -205,6 +208,9 @@ static void pgsrt_ExecutorRun(QueryDesc *queryDesc,
 static void pgsrt_ExecutorFinish(QueryDesc *queryDesc);
 static void pgsrt_ExecutorEnd(QueryDesc *queryDesc);
 
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
@@ -303,17 +309,21 @@ _PG_init(void)
 
 	EmitWarningsOnPlaceholders("pg_sortstats");
 
+#if PG_VERSION_NUM < 150000
 	/*
 	 * Request additional shared resources.  (These are no-ops if we're not in
 	 * the postmaster process.)  We'll allocate or attach to the shared
 	 * resources in pgsrt_shmem_startup().
+	 * If you change code here, don't forget to also report the modifications
+	 * in pgsrt_shmem_request() for pg15 and later.
 	 */
 	RequestAddinShmemSpace(pgsrt_memsize());
 #if PG_VERSION_NUM >= 90600
 	RequestNamedLWLockTranche("pg_sortstats", 2);
 #else
 	RequestAddinLWLocks(1);
-#endif
+#endif		/* pg 9.6+ */
+#endif		/* pg 15- */
 
 	/* install hooks */
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -324,9 +334,31 @@ _PG_init(void)
 	ExecutorFinish_hook = pgsrt_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pgsrt_ExecutorEnd;
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pgsrt_shmem_request;
+#endif
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgsrt_shmem_startup;
 }
+
+#if PG_VERSION_NUM >= 150000
+/*
+ * Request additional shared memory resources.
+ *
+ * If you change code here, don't forget to also report the modifications in
+ * _PG_init() for pg14 and below.
+ */
+static void
+pgsrt_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(pgsrt_memsize());
+	RequestNamedLWLockTranche("pg_sortstats", 2);
+}
+#endif
 
 static void
 pgsrt_shmem_startup(void)
@@ -789,7 +821,11 @@ pgsrt_memsize(void)
 static Size
 pgsrt_queryids_size(void)
 {
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= 150000
+	Assert(MaxBackends > 0);
+	/* We need an extra slot since BackendId numerotation starts at 1. */
+#define PGSRT_NB_BACKEND_SLOT (MaxBackends + 1)
+#elif PG_VERSION_NUM >= 120000
 	/* We need frrom for all possible backends, plus the autovacuum launcher
 	 * and workers, plus the background workers, and an extra one since
 	 * BackendId numerotation starts at 1.
