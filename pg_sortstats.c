@@ -21,7 +21,7 @@
  * requires holding pgsrt->lock exclusively; this allows individual entries
  * in the file to be read or written while holding only shared lock.
  *
- * Copyright (c) 2018, The PoWA-team
+ * Copyright (c) 2018-2023, The PoWA-team
  *
  *-------------------------------------------------------------------------
  */
